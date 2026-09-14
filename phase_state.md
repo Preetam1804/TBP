@@ -136,4 +136,21 @@ Phase 5 ATE validation.
 ### Next Actions
 Phase 5: Umeyama ATE + SP-1 report.
 
-
+## Phase 5 Completed: 2026-09-14 — SP-1 COMPLETE
+### Completed
+Umeyama ATE validator with condition guard; reports (JSON, plots, SP1_REPORT.md);
+'uav3d validate' CLI; real-data validation run.
+### Files Created
+validation/{ate,reports,__init__}.py, models/validation.py, tests/test_ate.py
+### Real-data Results (KPI vs target)
+registration=100.0% (target ≥85%); mean reproj=0.588px (target ≤1.5);
+ATE RMSE=1.2564m / median=1.1499m / p95=2.3486m; scale=7.6738; fit_condition=weak_flightline_geometry;
+matched=25/25; data label: replayed public dataset (Zurich Urban MAV) — not field-flight validation.
+### Known Limitations
+rolling shutter uncorrected; GPS multipath; stride-based keyframing only.
+### Remaining Tasks
+SP-2 handoff: depth (SP-2 consumes poses.json + keyframes.json).
+### Current Blockers
+<none>
+### Next Actions
+Bug-fix buffer / capture-guidance notes; then SP-2 Phase A (DepthAnything-V2-Small).

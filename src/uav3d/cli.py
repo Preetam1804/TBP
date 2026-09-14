@@ -23,6 +23,11 @@ from uav3d.sources.base import ImageSource
 from uav3d.sources.video import VideoFileSource
 from uav3d.sources.zurich import ZurichSequenceSource
 from uav3d.telemetry import TelemetrySynchronizer
+from uav3d.validation import (
+    compute_ate,
+    generate_sp1_report,
+    generate_validation_plots,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -379,6 +384,114 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_validate_command(args: argparse.Namespace) -> int:
+    """Execute the trajectory validation (ATE) pipeline command against ground truth."""
+    logger = setup_logging()
+    cfg = load_config(args.config if os.path.exists(args.config) else None)
+    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+
+    with timed_stage("validate", logger=logger):
+        # 1. Resolve run directory
+        if args.run_dir:
+            run_dir = Path(args.run_dir).resolve()
+        else:
+            outputs_dir = Path(data_dir) / "outputs"
+            if not outputs_dir.exists():
+                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
+            run_dirs = sorted(
+                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
+                key=lambda p: p.name,
+            )
+            if not run_dirs:
+                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
+            run_dir = run_dirs[-1]
+
+        logger.info(f"Target validation run directory: {run_dir}")
+        poses_path = run_dir / "poses.json"
+        if not poses_path.exists():
+            raise Uav3dError(f"poses.json does not exist in {run_dir}. Run 'uav3d sfm' first.")
+
+        # 2. Resolve ground truth file
+        gt_file = None
+        if getattr(args, "gt_file", None):
+            gt_file = Path(args.gt_file).resolve()
+        else:
+            candidates = [
+                Path(data_dir) / "raw" / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
+                Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
+                Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
+            ]
+            for c in candidates:
+                if c.exists():
+                    gt_file = c
+                    break
+
+        if gt_file is None or not gt_file.exists():
+            raise Uav3dError(
+                f"Ground truth file GroundTruthAGL.csv not found in standard paths under {data_dir}. "
+                "Please specify path with --gt-file."
+            )
+
+        logger.info(f"Using ground truth file: {gt_file}")
+
+        # 3. Load poses.json
+        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
+
+        # 4. Compute ATE metrics and alignment
+        ate_report = compute_ate(
+            poses_file=poses_file,
+            gt_records=gt_file,
+            ate_threshold_m=5.0,
+            dataset_label=cfg.dataset_label,
+        )
+
+        # 5. Export ate_report.json
+        ate_json_path = run_dir / "ate_report.json"
+        ate_json_path.write_text(ate_report.model_dump_json(indent=2), encoding="utf-8")
+        logger.info(f"Wrote ATE report to {ate_json_path}")
+
+        # 6. Generate plots
+        plots = generate_validation_plots(ate_report, output_dir=run_dir)
+
+        # 7. Generate SP1_REPORT.md
+        sp1_report_path = generate_sp1_report(run_dir=run_dir, report=ate_report, config=cfg, plots=plots)
+        logger.info(f"Generated SP-1 Markdown report at {sp1_report_path}")
+
+        # 8. Display Rich summary table
+        table = Table(
+            title=f"SP-1 Trajectory ATE Validation: [bold cyan]{run_dir.name}[/bold cyan]",
+            show_header=True,
+        )
+        table.add_column("Metric / Parameter", style="bold white", width=28)
+        table.add_column("Value", style="green")
+
+        m = ate_report.metrics
+        table.add_row("Run Directory", str(run_dir))
+        table.add_row("Dataset Provenance", ate_report.dataset_label)
+        table.add_row("Matched Frames (SfM & GT)", f"{m.num_matched_frames} / {m.num_registered_frames}")
+
+        cond_color = "yellow" if m.fit_condition != "ok" else "green"
+        table.add_row("Geometry Condition Check", f"[{cond_color}][bold]{m.fit_condition}[/bold][/{cond_color}]")
+        table.add_row("Similarity Scale Factor (s)", f"{m.scale_factor:.4f}")
+        table.add_row("ATE RMSE (GT meters)", f"[bold]{m.rmse_m:.4f} m[/bold]")
+        table.add_row("ATE Median / P95", f"{m.median_m:.4f} m / {m.p95_m:.4f} m")
+        table.add_row("ATE Max Error", f"{m.max_m:.4f} m")
+
+        if m.registration_rate is not None:
+            reg_style = "bold green" if m.registration_rate >= 0.85 else "bold red"
+            table.add_row("Registration Rate (KPI >= 85%)", f"[{reg_style}]{m.registration_rate * 100:.1f}%[/{reg_style}]")
+
+        if m.mean_reprojection_error_px is not None:
+            reproj_style = "bold green" if m.mean_reprojection_error_px <= 1.5 else "bold red"
+            table.add_row("Reprojection Error (KPI <= 1.5px)", f"[{reproj_style}]{m.mean_reprojection_error_px:.3f} px[/{reproj_style}]")
+
+        table.add_row("Validation Status", f"[bold green]{ate_report.status.upper()}[/bold green]")
+        table.add_row("Report Artifacts", f"ate_report.json, SP1_REPORT.md, {', '.join(plots.values())}")
+
+        console.print(table)
+    return 0
+
+
 def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
     """Execute stub for unimplemented pipeline stage."""
     logger = setup_logging()
@@ -472,6 +585,18 @@ def create_parser() -> argparse.ArgumentParser:
         help="Evaluate estimated camera poses against ground truth (ATE metric)",
     )
     _add_common_arguments(validate_parser)
+    validate_parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Explicit run directory containing poses.json (defaults to latest run)",
+    )
+    validate_parser.add_argument(
+        "--gt-file",
+        type=str,
+        default=None,
+        help="Path to GroundTruthAGL.csv (defaults to dataset location)",
+    )
 
     return parser
 
@@ -493,6 +618,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_sfm_command(args)
         if args.command == "sync":
             return _handle_sync_command(args)
+        if args.command == "validate":
+            return _handle_validate_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()

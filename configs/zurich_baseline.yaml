@@ -3,7 +3,7 @@
 # All outputs are labeled "replayed public dataset".
 
 data_dir: "./data"
-dataset_label: "replayed public dataset"
+dataset_label: "replayed public dataset (Zurich Urban MAV) — not field-flight validation"
 
 source:
   type: "zurich"

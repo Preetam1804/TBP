@@ -13,6 +13,7 @@ dependencies = [
     "pyyaml",
     "pyproj",
     "rich",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
