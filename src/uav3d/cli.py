@@ -16,6 +16,7 @@ from uav3d.config import PipelineConfig, load_config
 from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
+from uav3d.models.frames import CameraCalibration
 from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
 from uav3d.sfm import SfmRunner, export_poses
@@ -233,9 +234,46 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         timestamps_map = {kf.frame_id: kf.timestamp_us for kf in kf_file.keyframes}
 
         # 3. Obtain camera calibration
-        source = _build_source(cfg, data_dir, args)
-        calibration = source.calibration()
-        logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+        # Check actual image dimensions in images_dir to avoid Zurich calibration mismatch
+        actual_width, actual_height = None, None
+        if all_image_names:
+            first_img_path = images_dir / all_image_names[0]
+            if first_img_path.exists():
+                import cv2
+
+                sample_mat = cv2.imread(str(first_img_path))
+                if sample_mat is not None:
+                    actual_height, actual_width = sample_mat.shape[:2]
+
+        is_video_run = (
+            any(name.startswith("video_") for name in all_image_names)
+            or getattr(args, "video", None) is not None
+            or cfg.source.type.lower() == "video"
+        )
+
+        if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
+            w = actual_width or 1920
+            h = actual_height or 1080
+            fx = fy = float(w) * 0.9
+            cx = float(w) / 2.0
+            cy = float(h) / 2.0
+            calibration = CameraCalibration(
+                model="PINHOLE",
+                width=w,
+                height=h,
+                params=[fx, fy, cx, cy],
+                source=f"auto_video_{w}x{h}",
+            )
+            cfg.sfm.camera_model = "PINHOLE"
+            cfg.sfm.refine_intrinsics = True
+            logger.info(
+                f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
+                f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
+            )
+        else:
+            source = _build_source(cfg, data_dir, args)
+            calibration = source.calibration()
+            logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
 
         # 4. Optional CLI overrides
         if getattr(args, "overlap", None) is not None:
