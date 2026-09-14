@@ -1,0 +1,31 @@
+# Baseline pipeline configuration for Zurich Urban MAV dataset (ETH RPG)
+# Note: Zurich dataset dev runs process 150-300 contiguous images.
+# All outputs are labeled "replayed public dataset".
+
+data_dir: "./data"
+dataset_label: "replayed public dataset"
+
+ingest:
+  source_type: "zurich"
+  start_frame: 0
+  max_frames: 300
+
+keyframes:
+  strategy: "laplacian_variance"
+  stride: 2
+  sharpness_threshold: 100.0
+  target_count: 150
+
+sfm:
+  camera_model: "PINHOLE"
+  feature_type: "SIFT"
+  matcher_type: "exhaustive"
+  min_num_matches: 15
+
+sync:
+  max_delta_us: 50000
+  strategy: "nearest"
+
+validation:
+  alignment: "sim3"
+  ate_threshold_meters: 5.0

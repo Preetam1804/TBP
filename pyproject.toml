@@ -1,0 +1,35 @@
+[project]
+name = "uav3d"
+version = "0.1.0"
+description = "Single-pass UAV video to 3D pipeline for SIH 26158 SP-1"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "pycolmap==3.12.*",
+    "opencv-python==4.10.*",
+    "numpy",
+    "scipy",
+    "pydantic>=2",
+    "pyyaml",
+    "pyproj",
+    "rich",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+uav3d = "uav3d.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

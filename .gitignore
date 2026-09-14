@@ -1,0 +1,29 @@
+# IDE / Internal
+.freebuff/
+
+# Virtual Environment
+.venv/
+env/
+venv/
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/interim/.gitkeep
