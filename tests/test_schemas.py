@@ -141,7 +141,11 @@ class TestConfigLoading:
         cfg = load_config("configs/zurich_baseline.yaml")
         assert isinstance(cfg, PipelineConfig)
         assert cfg.dataset_label == "replayed public dataset"
-        assert cfg.sfm.camera_model == "PINHOLE"
+        assert cfg.sfm.camera_model == "OPENCV"
+        assert cfg.sfm.single_camera is True
+        assert cfg.sfm.seq_overlap == 10
+        assert cfg.sfm.max_image_size == 1600
+        assert cfg.sfm.refine_intrinsics is False
         assert cfg.keyframes.strategy == "laplacian_variance"
 
     def test_missing_config_raises(self) -> None:

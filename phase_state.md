@@ -100,3 +100,21 @@ Phase 3 SfM.
 None.
 ### Next Actions
 Phase 3: pycolmap SfM runner + poses.json.
+
+## Phase 3 Completed: 2026-09-14
+### Completed
+Scratch API check; SfM runner (locked intrinsics, sequential matching, model selection);
+poses.json exporter with metrics; 'uav3d sfm' CLI; real-data run.
+### Files Created
+sfm/{runner,colmap_export,colmap_compat,__init__}.py, scripts/scratch_pycolmap_check.py, tests/test_sfm_export.py
+### Decisions Made
+pycolmap 3.12.6; cam_from_world API = confirmed modern Image.cam_from_world() method returning Rigid3d, with Rotation3d.quat in Eigen [x, y, z, w] format mapped to [qw, qx, qy, qz] (wxyz) order via compat shim (supporting legacy qvec/tvec as fallback); intrinsics locked via database camera injection + IncrementalPipelineOptions BA refinement flags (ba_refine_focal_length=False, ba_refine_principal_point=False, ba_refine_extra_params=False, abs_pose_refine_*=False) and verified identical post-BA ([1060.0, 1060.0, 960.0, 540.0, -0.05, 0.01, 0.0, 0.0]); seq_overlap=10; max_image_size=1600.
+### Real-data Results
+models=1, registered=25/25 (100.0%), mean reproj err=0.588 px, runtime=19.25s, peak RSS=6486.5 MB
+### Remaining Tasks
+Phase 4 telemetry sync.
+### Current Blockers
+None.
+### Next Actions
+Phase 4: TelemetrySynchronizer.
+

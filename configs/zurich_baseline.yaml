@@ -27,10 +27,17 @@ keyframes:
   orb_features: 2000
 
 sfm:
-  camera_model: "PINHOLE"
+  camera_model: "OPENCV"
+  single_camera: true
+  seq_overlap: 10
+  max_image_size: 1600
+  refine_intrinsics: false
   feature_type: "SIFT"
-  matcher_type: "exhaustive"
+  matcher_type: "sequential"
   min_num_matches: 15
+  init_min_inliers: 15
+  init_min_tri_angle: 2.0
+  abs_pose_min_inliers: 10
 
 sync:
   max_delta_us: 50000

@@ -12,10 +12,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from uav3d import __version__
-from uav3d.config import load_config
+from uav3d.config import PipelineConfig, load_config
 from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
+from uav3d.models.keyframes import KeyframesFile
+from uav3d.sfm import SfmRunner, export_poses
+from uav3d.sources.base import ImageSource
 from uav3d.sources.video import VideoFileSource
 from uav3d.sources.zurich import ZurichSequenceSource
 
@@ -41,6 +44,27 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) -> ImageSource:
+    """Build and initialize ImageSource adapter from configuration."""
+    source_type = cfg.source.type.lower()
+    if source_type == "zurich":
+        dataset_path = Path(args.data_dir) if args.data_dir else Path(cfg.source.dataset_dir)
+        if not dataset_path.is_absolute():
+            dataset_path = (Path(data_dir).parent / dataset_path).resolve() if not dataset_path.exists() else dataset_path.resolve()
+
+        return ZurichSequenceSource(
+            dataset_dir=dataset_path,
+            start_id=cfg.source.start_id,
+            count=cfg.source.count,
+            stride=cfg.source.stride,
+        )
+    if source_type == "video":
+        video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4"))
+        return VideoFileSource(video_path=video_path)
+
+    raise Uav3dError(f"Unsupported source type '{source_type}'. Must be 'zurich' or 'video'.")
+
+
 def _handle_inspect_command(args: argparse.Namespace) -> int:
     """Execute the inspect pipeline command."""
     logger = setup_logging()
@@ -48,26 +72,8 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
 
     with timed_stage("inspect", logger=logger):
-        # Resolve dataset directory for Zurich or video path
         source_type = cfg.source.type.lower()
-        if source_type == "zurich":
-            # If data_dir given on CLI or env, override dataset_dir
-            dataset_path = Path(args.data_dir) if args.data_dir else Path(cfg.source.dataset_dir)
-            if not dataset_path.is_absolute():
-                dataset_path = (Path(data_dir).parent / dataset_path).resolve() if not dataset_path.exists() else dataset_path.resolve()
-
-            source = ZurichSequenceSource(
-                dataset_dir=dataset_path,
-                start_id=cfg.source.start_id,
-                count=cfg.source.count,
-                stride=cfg.source.stride,
-            )
-        elif source_type == "video":
-            video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4"))
-            source = VideoFileSource(video_path=video_path)
-        else:
-            raise Uav3dError(f"Unsupported source type '{source_type}'. Must be 'zurich' or 'video'.")
-
+        source = _build_source(cfg, data_dir, args)
         meta = source.metadata()
         calib = source.calibration()
 
@@ -132,23 +138,7 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
 
     with timed_stage("keyframes", logger=logger):
-        source_type = cfg.source.type.lower()
-        if source_type == "zurich":
-            dataset_path = Path(args.data_dir) if args.data_dir else Path(cfg.source.dataset_dir)
-            if not dataset_path.is_absolute():
-                dataset_path = (Path(data_dir).parent / dataset_path).resolve() if not dataset_path.exists() else dataset_path.resolve()
-            source = ZurichSequenceSource(
-                dataset_dir=dataset_path,
-                start_id=cfg.source.start_id,
-                count=cfg.source.count,
-                stride=cfg.source.stride,
-            )
-        elif source_type == "video":
-            video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4"))
-            source = VideoFileSource(video_path=video_path)
-        else:
-            raise Uav3dError(f"Unsupported source type '{source_type}'. Must be 'zurich' or 'video'.")
-
+        source = _build_source(cfg, data_dir, args)
         timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
 
@@ -181,6 +171,118 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         table.add_row("Contact Sheet", str(summary.contact_sheet_path))
 
         console.print(table)
+    return 0
+
+
+def _handle_sfm_command(args: argparse.Namespace) -> int:
+    """Execute pycolmap incremental visual Structure-from-Motion."""
+    logger = setup_logging()
+    cfg = load_config(args.config if os.path.exists(args.config) else None)
+    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+
+    with timed_stage("sfm", logger=logger):
+        # 1. Determine run directory
+        if getattr(args, "run_dir", None):
+            run_dir = Path(args.run_dir).resolve()
+        else:
+            outputs_dir = Path(data_dir) / "outputs"
+            if not outputs_dir.exists():
+                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d keyframes' first.")
+            run_dirs = sorted(
+                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
+                key=lambda p: p.name,
+            )
+            if not run_dirs:
+                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d keyframes' first.")
+            run_dir = run_dirs[-1]
+
+        logger.info(f"Target SfM run directory: {run_dir}")
+        images_dir = run_dir / "sfm" / "images"
+        keyframes_json_path = run_dir / "keyframes.json"
+
+        if not images_dir.exists():
+            raise Uav3dError(f"Keyframe images directory {images_dir} does not exist in {run_dir}.")
+        if not keyframes_json_path.exists():
+            raise Uav3dError(f"keyframes.json does not exist in {run_dir}. Run 'uav3d keyframes' first.")
+
+        # 2. Load keyframes metadata
+        kf_file = KeyframesFile.model_validate_json(keyframes_json_path.read_text(encoding="utf-8"))
+        all_image_names = [f"{kf.frame_id}.jpg" for kf in kf_file.keyframes]
+        timestamps_map = {kf.frame_id: kf.timestamp_us for kf in kf_file.keyframes}
+
+        # 3. Obtain camera calibration
+        source = _build_source(cfg, data_dir, args)
+        calibration = source.calibration()
+        logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+
+        # 4. Optional CLI overrides
+        if getattr(args, "overlap", None) is not None:
+            cfg.sfm.seq_overlap = args.overlap
+
+        # 5. Execute SfM
+        runner = SfmRunner(config=cfg.sfm)
+        result = runner.run(images_dir=images_dir, output_dir=run_dir, calibration=calibration)
+
+        # 6. Export poses.json
+        poses_path = run_dir / "poses.json"
+        poses_file = export_poses(
+            reconstruction=result.reconstruction,
+            all_image_names=all_image_names,
+            camera_calibration=calibration,
+            output_path=poses_path,
+            dataset_label=cfg.dataset_label,
+            scale_factor=1.0,
+            timestamps_map=timestamps_map,
+        )
+
+        # 7. Print summary table
+        table = Table(
+            title=f"SfM Reconstruction Summary: [bold cyan]{run_dir.name}[/bold cyan]",
+            show_header=True,
+        )
+        table.add_column("Metric / Property", style="bold white", width=28)
+        table.add_column("Value", style="green")
+
+        table.add_row("Input Keyframes", str(result.total_images))
+        table.add_row("Registered Frames", f"[bold green]{result.num_reg_images}[/bold green] / {result.total_images}")
+        rate_style = "bold green" if result.registration_rate >= 0.85 else "bold red"
+        table.add_row("Registration Rate", f"[{rate_style}]{result.registration_rate*100:.1f}%[/{rate_style}] (target: >= 85%)")
+        reproj_style = "bold green" if result.mean_reprojection_error_px <= 1.5 else "bold yellow"
+        table.add_row(
+            "Mean Reprojection Error",
+            f"[{reproj_style}]{result.mean_reprojection_error_px:.3f} px[/{reproj_style}] (target: <= 1.5 px)",
+        )
+        table.add_row(
+            "Reconstructed 3D Points",
+            f"{result.reconstruction.num_points3D():,}" if hasattr(result.reconstruction, "num_points3D") else "N/A",
+        )
+        table.add_row(
+            "Mean Track Length",
+            f"{result.reconstruction.compute_mean_track_length():.2f}" if hasattr(result.reconstruction, "compute_mean_track_length") else "N/A",
+        )
+        table.add_row("Models Formed", str(result.num_models))
+        table.add_row("Total Wall Time", f"{result.total_wall_time_s:.2f}s")
+        table.add_row("Peak Memory (RSS)", f"{result.peak_rss_mb:.1f} MB")
+        table.add_row("Poses File", str(poses_path))
+        table.add_row("COLMAP Database", str(result.database_path))
+        table.add_row("Sparse Reconstruction", str(result.sparse_dir))
+        table.add_row(
+            "Intrinsics Locked",
+            f"{poses_file.camera.params if poses_file.camera else calibration.params}",
+        )
+
+        console.print(table)
+
+        if result.registration_rate < 0.85:
+            console.print(
+                "[yellow]Warning: Registration rate below 85% KPI. Consider increasing sequential overlap or adjusting keyframe stride.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[bold green]SfM Quality Gate Passed:[/bold green] Registration {result.registration_rate*100:.1f}% >= 85%, "
+                f"Reprojection Error {result.mean_reprojection_error_px:.3f} px <= 1.5 px."
+            )
+
     return 0
 
 
@@ -238,6 +340,18 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run pycolmap visual Structure-from-Motion camera pose estimation",
     )
     _add_common_arguments(sfm_parser)
+    sfm_parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Explicit run directory containing sfm/images and keyframes.json (defaults to latest run)",
+    )
+    sfm_parser.add_argument(
+        "--overlap",
+        type=int,
+        default=None,
+        help="Override sequential matching overlap window",
+    )
 
     # 4. sync
     sync_parser = subparsers.add_parser(
@@ -269,6 +383,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_inspect_command(args)
         if args.command == "keyframes":
             return _handle_keyframes_command(args)
+        if args.command == "sfm":
+            return _handle_sfm_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()

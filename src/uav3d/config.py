@@ -41,10 +41,19 @@ class SfmConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    camera_model: str = Field(default="PINHOLE", description="COLMAP camera model")
+    camera_model: str = Field(default="OPENCV", description="COLMAP camera model")
+    single_camera: bool = Field(default=True, description="Share a single camera intrinsic model across all frames")
+    seq_overlap: int = Field(default=10, ge=1, description="Sequential matching overlap window")
+    max_image_size: int = Field(default=1600, gt=0, description="Maximum image dimension for feature extraction")
+    refine_intrinsics: bool = Field(default=False, description="Whether to refine camera intrinsics during bundle adjustment")
     feature_type: str = Field(default="SIFT", description="Feature extractor type")
-    matcher_type: str = Field(default="exhaustive", description="COLMAP matcher type")
+    matcher_type: str = Field(default="sequential", description="COLMAP matcher type (sequential or exhaustive)")
     min_num_matches: int = Field(default=15, ge=1, description="Minimum inlier matches for pair")
+    init_min_inliers: int = Field(default=15, ge=1, description="Minimum inliers for initial pair")
+    init_min_tri_angle: float = Field(default=2.0, ge=0.0, description="Minimum triangulation angle for initial pair in degrees")
+    abs_pose_min_inliers: int = Field(default=10, ge=1, description="Minimum inliers for absolute pose registration")
+    min_model_size: int = Field(default=3, ge=2, description="Minimum registered images to keep reconstruction")
+    ignore_watermarks: bool = Field(default=True, description="Whether to ignore watermark detection in sequential matching")
 
 
 class SyncConfig(BaseModel):
