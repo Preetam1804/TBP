@@ -17,7 +17,7 @@ class TestSchemaSerialization:
 
     def test_frame_record_round_trip(self) -> None:
         record = FrameRecord(
-            frame_id=0,
+            frame_id="zurich_000000",
             timestamp_us=1459425600000000,
             file_path="data/raw/zurich/images/frame_00000.jpg",
             width=1920,
@@ -46,13 +46,13 @@ class TestSchemaSerialization:
             dataset_label="replayed public dataset",
             keyframes=[
                 KeyframeRecord(
-                    frame_id=0,
+                    frame_id="zurich_000000",
                     timestamp_us=1459425600000000,
                     file_path="data/interim/keyframes/frame_00000.jpg",
                     score=142.5,
                 ),
                 KeyframeRecord(
-                    frame_id=5,
+                    frame_id="zurich_000005",
                     timestamp_us=1459425600166666,
                     file_path="data/interim/keyframes/frame_00005.jpg",
                     score=168.2,
@@ -72,7 +72,7 @@ class TestSchemaSerialization:
             records=[
                 TelemetryRecord(
                     timestamp_us=1459425600000000,
-                    frame_id=0,
+                    frame_id="zurich_000000",
                     lat=47.3769,
                     lon=8.5417,
                     alt=450.0,
@@ -94,7 +94,7 @@ class TestSchemaSerialization:
             coordinate_frame="cam_from_world",
             poses=[
                 PoseRecord(
-                    frame_id=0,
+                    frame_id="zurich_000000",
                     timestamp_us=1459425600000000,
                     qw=1.0,
                     qx=0.0,
@@ -117,7 +117,7 @@ class TestSchemaSerialization:
         """Verify that extra='forbid' strictly rejects unknown fields."""
         with pytest.raises(ValidationError):
             FrameRecord(
-                frame_id=0,
+                frame_id="zurich_000000",
                 timestamp_us=1000,
                 file_path="test.jpg",
                 width=1920,

@@ -60,6 +60,19 @@ class ValidationConfig(BaseModel):
     ate_threshold_meters: float = Field(default=5.0, gt=0.0, description="Absolute Trajectory Error warning threshold")
 
 
+class SourceConfig(BaseModel):
+    """Configuration for image sequence or video source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(default="zurich", description="Source type: 'zurich' or 'video'")
+    dataset_dir: str = Field(default="data/raw/zurich_mav", description="Path to Zurich dataset root")
+    video_path: str | None = Field(default=None, description="Path to video file if type is 'video'")
+    start_id: int = Field(default=0, ge=0, description="Starting numeric image/frame identifier")
+    count: int = Field(default=250, gt=0, le=300, description="Contiguous frame count (<= 300)")
+    stride: int = Field(default=1, ge=1, description="Frame sampling stride")
+
+
 class PipelineConfig(BaseModel):
     """Root configuration for uav3d pipeline."""
 
@@ -67,6 +80,7 @@ class PipelineConfig(BaseModel):
 
     data_dir: str = Field(default="./data", description="Root data directory")
     dataset_label: str = Field(default="replayed public dataset", description="Dataset provenance label")
+    source: SourceConfig = Field(default_factory=SourceConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
     keyframes: KeyframeConfig = Field(default_factory=KeyframeConfig)
     sfm: SfmConfig = Field(default_factory=SfmConfig)

@@ -5,6 +5,13 @@
 data_dir: "./data"
 dataset_label: "replayed public dataset"
 
+source:
+  type: "zurich"
+  dataset_dir: "data/raw/zurich_mav"
+  start_id: 0
+  count: 250
+  stride: 1
+
 ingest:
   source_type: "zurich"
   start_frame: 0

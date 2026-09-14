@@ -9,13 +9,14 @@ class TelemetryRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     timestamp_us: int = Field(..., description="Timestamp in integer microseconds")
-    frame_id: int | None = Field(default=None, description="Mapped frame identifier, if synchronized")
+    frame_id: str | None = Field(default=None, description="Mapped frame identifier (e.g. zurich_000123), if synchronized")
     lat: float | None = Field(default=None, description="WGS84 latitude in degrees")
     lon: float | None = Field(default=None, description="WGS84 longitude in degrees")
     alt: float | None = Field(default=None, description="Altitude in meters")
     easting: float | None = Field(default=None, description="Projected Easting coordinate in meters (UTM/local)")
     northing: float | None = Field(default=None, description="Projected Northing coordinate in meters (UTM/local)")
     source: str | None = Field(default=None, description="Source log name (e.g. OnbordGPS.csv)")
+    raw_fields: dict[str, str] | None = Field(default=None, description="Raw CSV key-value fields for traceability")
 
 
 class TelemetryFile(BaseModel):

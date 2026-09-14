@@ -13,7 +13,7 @@ class PoseRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    frame_id: int = Field(..., description="Frame identifier associated with this pose")
+    frame_id: str = Field(..., description="Frame identifier associated with this pose (e.g. zurich_000123)")
     timestamp_us: int | None = Field(default=None, description="Capture timestamp in integer microseconds")
     qw: float = Field(..., description="Quaternion w (scalar component)")
     qx: float = Field(..., description="Quaternion x")

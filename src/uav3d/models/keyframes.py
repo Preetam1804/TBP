@@ -8,8 +8,8 @@ class KeyframeRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    frame_id: int = Field(..., description="Unique frame identifier")
-    timestamp_us: int = Field(..., description="Frame timestamp in integer microseconds")
+    frame_id: str = Field(..., description="Unique frame identifier (e.g. zurich_000123)")
+    timestamp_us: int | None = Field(default=None, description="Frame timestamp in integer microseconds, or None")
     file_path: str = Field(..., description="Relative or absolute path to keyframe image")
     score: float | None = Field(default=None, description="Optional keyframe selection quality score")
 
