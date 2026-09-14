@@ -61,8 +61,10 @@ class SyncConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    max_delta_us: int = Field(default=50000, ge=0, description="Max tolerance delta in microseconds")
+    max_delta_us: int = Field(default=500000, ge=0, description="Max tolerance delta in microseconds (default 500ms)")
     strategy: str = Field(default="nearest", description="Sync strategy (nearest or linear)")
+    estimate_offset: bool = Field(default=True, description="Whether to estimate constant clock offset for Mode B")
+    min_match_rate: float = Field(default=0.8, ge=0.0, le=1.0, description="Minimum match rate required for synchronized status")
 
 
 class ValidationConfig(BaseModel):

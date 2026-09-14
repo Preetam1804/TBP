@@ -118,3 +118,22 @@ None.
 ### Next Actions
 Phase 4: TelemetrySynchronizer.
 
+## Phase 4 Completed: 2026-09-14
+### Completed
+TelemetrySynchronizer (Mode A ID-mapping, Mode B timestamp+offset); 'uav3d sync' CLI;
+telemetry.json + poses_enriched.json on real data.
+### Files Created
+telemetry/synchronizer.py, tests/test_telemetry.py
+### Decisions Made
+Mode A only for Zurich (no offset estimation); 80% match threshold for Mode B status;
+poses.json untouched; recommended_crs via pyproj.
+### Real-data Results
+matched=25/25, sync_status=dataset_image_id_mapping, GPS range lat/lon=lat [47.376900, 47.377620], lon [8.541700, 8.542564], alt [450.00, 454.80] m
+### Remaining Tasks
+Phase 5 ATE validation.
+### Current Blockers
+<none>
+### Next Actions
+Phase 5: Umeyama ATE + SP-1 report.
+
+

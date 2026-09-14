@@ -1,5 +1,7 @@
 """Models for telemetry synchronization output."""
 
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -8,7 +10,7 @@ class TelemetryRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    timestamp_us: int = Field(..., description="Timestamp in integer microseconds")
+    timestamp_us: int | None = Field(default=None, description="Timestamp in integer microseconds")
     frame_id: str | None = Field(default=None, description="Mapped frame identifier (e.g. zurich_000123), if synchronized")
     lat: float | None = Field(default=None, description="WGS84 latitude in degrees")
     lon: float | None = Field(default=None, description="WGS84 longitude in degrees")
@@ -26,4 +28,28 @@ class TelemetryFile(BaseModel):
 
     schema_version: str = Field(default="1.0.0", description="Schema specification version")
     dataset_label: str = Field(default="replayed public dataset", description="Dataset provenance label")
+    sync_status: str | None = Field(
+        default=None,
+        description="Synchronization status (e.g. dataset_image_id_mapping, timestamp_nearest_offset_estimated, manifest, unsynchronized)",
+    )
+    offset_estimation: str | None = Field(
+        default=None,
+        description="Clock offset estimation strategy applied (e.g. not_applicable, median_offset, manifest)",
+    )
+    offset_us: int | None = Field(
+        default=None,
+        description="Estimated constant clock offset in microseconds (telemetry_t - frame_t)",
+    )
+    recommended_crs: str | None = Field(
+        default=None,
+        description="Recommended coordinate reference system (e.g. local ENU or UTM zone from pyproj)",
+    )
+    distance_consistency_note: str | None = Field(
+        default=None,
+        description="Sanity check note comparing GPS step distances vs SfM relative camera distances",
+    )
+    summary: dict[str, Any] | None = Field(
+        default=None,
+        description="Detailed sync summary statistics (total frames, matched count, match rate, residual stats)",
+    )
     records: list[TelemetryRecord] = Field(..., description="List of synchronized telemetry records")

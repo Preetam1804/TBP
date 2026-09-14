@@ -38,6 +38,10 @@ class PoseRecord(BaseModel):
         default=True,
         description="Whether this frame was successfully registered in the reconstruction",
     )
+    telemetry_recorded: bool | None = Field(
+        default=None,
+        description="Whether GPS telemetry was recorded/matched for this frame",
+    )
 
     @property
     def qvec(self) -> list[float]:

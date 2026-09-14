@@ -17,10 +17,12 @@ from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
 from uav3d.models.keyframes import KeyframesFile
+from uav3d.models.poses import PosesFile
 from uav3d.sfm import SfmRunner, export_poses
 from uav3d.sources.base import ImageSource
 from uav3d.sources.video import VideoFileSource
 from uav3d.sources.zurich import ZurichSequenceSource
+from uav3d.telemetry import TelemetrySynchronizer
 
 console = Console()
 err_console = Console(stderr=True)
@@ -286,6 +288,97 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_sync_command(args: argparse.Namespace) -> int:
+    """Execute telemetry synchronization and emit georef-ready outputs."""
+    logger = setup_logging()
+    cfg = load_config(args.config if os.path.exists(args.config) else None)
+    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+
+    with timed_stage("sync", logger=logger):
+        # 1. Determine run directory
+        if getattr(args, "run_dir", None):
+            run_dir = Path(args.run_dir).resolve()
+        else:
+            outputs_dir = Path(data_dir) / "outputs"
+            if not outputs_dir.exists():
+                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
+            run_dirs = sorted(
+                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
+                key=lambda p: p.name,
+            )
+            if not run_dirs:
+                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
+            run_dir = run_dirs[-1]
+
+        logger.info(f"Target Sync run directory: {run_dir}")
+        poses_path = run_dir / "poses.json"
+        keyframes_path = run_dir / "keyframes.json"
+
+        if not poses_path.exists():
+            raise Uav3dError(f"poses.json does not exist in {run_dir}. Run 'uav3d sfm' first.")
+        if not keyframes_path.exists():
+            raise Uav3dError(f"keyframes.json does not exist in {run_dir}. Run 'uav3d keyframes' first.")
+
+        # 2. Load inputs
+        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
+        kf_file = KeyframesFile.model_validate_json(keyframes_path.read_text(encoding="utf-8"))
+
+        # 3. Load source telemetry
+        source = _build_source(cfg, data_dir, args)
+        raw_telemetry = None
+        if hasattr(source, "_gps_records"):
+            raw_telemetry = source._gps_records
+
+        # 4. Perform synchronization
+        sync_mode = getattr(args, "mode", "auto")
+        synchronizer = TelemetrySynchronizer(config=cfg.sync)
+        tel_file, poses_enriched = synchronizer.sync(
+            poses=poses_file,
+            keyframes=kf_file,
+            raw_telemetry=raw_telemetry,
+            dataset_label=cfg.dataset_label,
+            mode=sync_mode,
+        )
+
+        # 5. Write outputs
+        telemetry_path = run_dir / "telemetry.json"
+        telemetry_path.write_text(tel_file.model_dump_json(indent=2), encoding="utf-8")
+        logger.info(f"Wrote synchronized telemetry to {telemetry_path}")
+
+        poses_enriched_path = run_dir / "poses_enriched.json"
+        poses_enriched_path.write_text(poses_enriched.model_dump_json(indent=2), encoding="utf-8")
+        logger.info(f"Wrote enriched poses to {poses_enriched_path}")
+
+        # 6. Display Summary Table
+        table = Table(
+            title=f"Telemetry Synchronization Summary: [bold cyan]{run_dir.name}[/bold cyan]",
+            show_header=True,
+        )
+        table.add_column("Metric / Property", style="bold white", width=28)
+        table.add_column("Value", style="green")
+
+        total_poses = len(poses_file.poses)
+        matched = tel_file.summary.get("matched_telemetry_frames", 0) if tel_file.summary else 0
+        match_rate = tel_file.summary.get("match_rate", 0.0) if tel_file.summary else 0.0
+
+        table.add_row("Run Directory", str(run_dir))
+        table.add_row("Poses Evaluated", str(total_poses))
+        table.add_row("Matched Telemetry Frames", f"{matched} / {total_poses} ({match_rate*100:.1f}%)")
+        table.add_row("Sync Status", f"[bold]{tel_file.sync_status}[/bold]")
+        table.add_row("Offset Estimation", str(tel_file.offset_estimation))
+        table.add_row(
+            "Clock Offset (µs)",
+            f"{tel_file.offset_us} µs" if tel_file.offset_us is not None else "N/A",
+        )
+        table.add_row("Recommended CRS", str(tel_file.recommended_crs))
+        table.add_row("Distance Consistency Note", str(tel_file.distance_consistency_note))
+        table.add_row("Telemetry JSON", str(telemetry_path))
+        table.add_row("Enriched Poses JSON", str(poses_enriched_path))
+
+        console.print(table)
+    return 0
+
+
 def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
     """Execute stub for unimplemented pipeline stage."""
     logger = setup_logging()
@@ -359,6 +452,19 @@ def create_parser() -> argparse.ArgumentParser:
         help="Synchronize onboard telemetry logs with keyframes",
     )
     _add_common_arguments(sync_parser)
+    sync_parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Explicit run directory containing poses.json and keyframes.json (defaults to latest run)",
+    )
+    sync_parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["auto", "zurich", "video"],
+        default="auto",
+        help="Telemetry synchronization mode (auto, zurich, or video)",
+    )
 
     # 5. validate
     validate_parser = subparsers.add_parser(
@@ -385,6 +491,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_keyframes_command(args)
         if args.command == "sfm":
             return _handle_sfm_command(args)
+        if args.command == "sync":
+            return _handle_sync_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()
