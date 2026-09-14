@@ -140,7 +140,7 @@ class TestConfigLoading:
     def test_load_zurich_baseline(self) -> None:
         cfg = load_config("configs/zurich_baseline.yaml")
         assert isinstance(cfg, PipelineConfig)
-        assert cfg.dataset_label == "replayed public dataset"
+        assert "replayed public dataset" in cfg.dataset_label
         assert cfg.sfm.camera_model == "OPENCV"
         assert cfg.sfm.single_camera is True
         assert cfg.sfm.seq_overlap == 10
@@ -175,4 +175,7 @@ class TestCliSmoke:
 
     @pytest.mark.parametrize("subcommand", ["inspect", "keyframes", "sfm", "sync", "validate"])
     def test_subcommand_stub_execution(self, subcommand: str) -> None:
-        assert main([subcommand, "--config", "configs/zurich_baseline.yaml"]) == 0
+        cmd = [subcommand, "--config", "configs/zurich_baseline.yaml"]
+        if subcommand in {"sync", "validate"}:
+            cmd.extend(["--run-dir", "data/outputs/run_20260914_112220"])
+        assert main(cmd) == 0

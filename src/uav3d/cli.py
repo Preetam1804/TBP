@@ -36,7 +36,7 @@ SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate")
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    """Attach standard --config and --data-dir flags to a subcommand parser."""
+    """Attach standard --config, --data-dir, and --video flags to a subcommand parser."""
     parser.add_argument(
         "--config",
         type=str,
@@ -49,10 +49,23 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Data directory root (overrides config data_dir and UAV3D_DATA_DIR env var)",
     )
+    parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="Path to an MP4/video file to process directly without telemetry",
+    )
 
 
 def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) -> ImageSource:
-    """Build and initialize ImageSource adapter from configuration."""
+    """Build and initialize ImageSource adapter from configuration or CLI arguments."""
+    video_cli = getattr(args, "video", None)
+    if video_cli:
+        video_path = Path(video_cli).resolve()
+        if not video_path.exists():
+            raise Uav3dError(f"Specified video file does not exist: {video_path}")
+        return VideoFileSource(video_path=video_path)
+
     source_type = cfg.source.type.lower()
     if source_type == "zurich":
         dataset_path = Path(args.data_dir) if args.data_dir else Path(cfg.source.dataset_dir)
@@ -66,7 +79,9 @@ def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) 
             stride=cfg.source.stride,
         )
     if source_type == "video":
-        video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4"))
+        video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4")).resolve()
+        if not video_path.exists():
+            raise Uav3dError(f"Video file not found at: {video_path}")
         return VideoFileSource(video_path=video_path)
 
     raise Uav3dError(f"Unsupported source type '{source_type}'. Must be 'zurich' or 'video'.")

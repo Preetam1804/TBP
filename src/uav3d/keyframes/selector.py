@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,17 +130,50 @@ class KeyframeSelector:
         all_clipping: list[float] = []
         all_features: list[float] = []
 
-        for frame in frames:
-            img_path = self._resolve_image_path(frame, source)
-            metrics = compute_frame_quality(img_path, orb_features=self.orb_features)
-            metrics_cache[frame.frame_id] = metrics
-            if metrics is None:
-                decode_failed_count += 1
-            else:
-                all_blur_scores.append(metrics.blur_score)
-                all_brightness.append(metrics.brightness_mean)
-                all_clipping.append(metrics.clipping_ratio)
-                all_features.append(float(metrics.feature_count))
+        # Detect if source is a video file or discrete image sequence
+        first_frame_path = Path(frames[0].file_path) if frames else Path()
+        is_video_source = (
+            first_frame_path.suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+            or hasattr(source, "video_path")
+            or "VideoFileSource" in source.__class__.__name__
+        )
+
+        if is_video_source:
+            video_file = str(getattr(source, "video_path", first_frame_path))
+            cap = cv2.VideoCapture(video_file)
+            try:
+                frame_idx = 0
+                while cap.isOpened() and frame_idx < total_frames:
+                    ret, bgr = cap.read()
+                    if not ret or bgr is None:
+                        decode_failed_count += 1
+                        frame_idx += 1
+                        continue
+                    metrics = compute_frame_quality(bgr, orb_features=self.orb_features)
+                    fid = frames[frame_idx].frame_id
+                    metrics_cache[fid] = metrics
+                    if metrics is None:
+                        decode_failed_count += 1
+                    else:
+                        all_blur_scores.append(metrics.blur_score)
+                        all_brightness.append(metrics.brightness_mean)
+                        all_clipping.append(metrics.clipping_ratio)
+                        all_features.append(float(metrics.feature_count))
+                    frame_idx += 1
+            finally:
+                cap.release()
+        else:
+            for frame in frames:
+                img_path = self._resolve_image_path(frame, source)
+                metrics = compute_frame_quality(img_path, orb_features=self.orb_features)
+                metrics_cache[frame.frame_id] = metrics
+                if metrics is None:
+                    decode_failed_count += 1
+                else:
+                    all_blur_scores.append(metrics.blur_score)
+                    all_brightness.append(metrics.brightness_mean)
+                    all_clipping.append(metrics.clipping_ratio)
+                    all_features.append(float(metrics.feature_count))
 
         # 3. Iterative selection with Overlap Guard
         current_stride = self.initial_stride
@@ -226,21 +260,40 @@ class KeyframeSelector:
         with open(json_path, "w", encoding="utf-8") as f:
             f.write(keyframes_file.model_dump_json(indent=2))
 
-        # 6. Symlink or copy selected images to sfm/images/{frame_id}.jpg
-        for rec in selected_records:
-            # Find original frame path
-            source_frame = source.get_frame(rec.frame_id)
-            orig_path = self._resolve_image_path(source_frame, source)
-
-            dest_path = sfm_images_dir / f"{rec.frame_id}.jpg"
-            if dest_path.exists() or dest_path.is_symlink():
-                dest_path.unlink()
-
-            # Attempt symlink; fall back to copy on Windows if permissions not held
+        # 6. Save selected keyframes to sfm/images/{frame_id}.jpg
+        if is_video_source:
+            video_file = str(getattr(source, "video_path", first_frame_path))
+            cap = cv2.VideoCapture(video_file)
             try:
-                os.symlink(orig_path.resolve(), dest_path)
-            except (OSError, NotImplementedError):
-                shutil.copy2(orig_path, dest_path)
+                for rec in selected_records:
+                    match = re.search(r"(\d+)$", rec.frame_id)
+                    if not match:
+                        continue
+                    idx = int(match.group(1))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, bgr = cap.read()
+                    dest_path = sfm_images_dir / f"{rec.frame_id}.jpg"
+                    if ret and bgr is not None:
+                        cv2.imwrite(str(dest_path), bgr)
+                    else:
+                        logger.warning(f"Failed to read frame index {idx} from video {video_file}")
+            finally:
+                cap.release()
+        else:
+            for rec in selected_records:
+                # Find original frame path
+                source_frame = source.get_frame(rec.frame_id)
+                orig_path = self._resolve_image_path(source_frame, source)
+
+                dest_path = sfm_images_dir / f"{rec.frame_id}.jpg"
+                if dest_path.exists() or dest_path.is_symlink():
+                    dest_path.unlink()
+
+                # Attempt symlink; fall back to copy on Windows if permissions not held
+                try:
+                    os.symlink(orig_path.resolve(), dest_path)
+                except (OSError, NotImplementedError):
+                    shutil.copy2(orig_path, dest_path)
 
         # 7. Generate contact sheet
         contact_sheet_path = debug_dir / "contact_sheet.jpg"

@@ -183,3 +183,28 @@ class TestCliKeyframesCommand:
 
         exit_code = main(["keyframes", "--config", str(config_path)])
         assert exit_code == 0
+
+    def test_keyframe_selection_from_video(self, tmp_path: Path) -> None:
+        """Verify that KeyframeSelector extracts and saves best frames from an MP4 video."""
+        from uav3d.sources.video import VideoFileSource
+
+        video_path = Path("data/interim/synthetic.mp4")
+        if not video_path.exists():
+            pytest.skip("synthetic.mp4 not found")
+
+        source = VideoFileSource(video_path=video_path)
+        selector = KeyframeSelector(
+            KeyframeConfig(
+                stride=10,
+                min_blur=10.0,
+                max_clipping=0.5,
+                max_gap=20,
+            )
+        )
+        res = selector.select(source, output_dir=tmp_path)
+        assert res.selected_count > 0
+        assert res.keyframes_json_path.exists()
+        extracted_images = list((tmp_path / "sfm" / "images").glob("*.jpg"))
+        assert len(extracted_images) == res.selected_count
+        assert all(img.stat().st_size > 1000 for img in extracted_images)
+

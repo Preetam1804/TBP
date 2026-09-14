@@ -25,32 +25,42 @@ class FrameQualityMetrics:
 
 
 def compute_frame_quality(
-    image_path: str | Path,
+    image_input: str | Path | np.ndarray,
     target_width: int = 640,
     orb_features: int = 2000,
 ) -> FrameQualityMetrics | None:
     """Compute blur, brightness, clipping, and feature count on a downscaled grayscale frame.
 
     Args:
-        image_path: Path to the image file.
+        image_input: Path to the image file or in-memory BGR/grayscale numpy array.
         target_width: Approximate width to downscale for fast evaluation (default 640px).
         orb_features: Maximum ORB features to detect.
 
     Returns:
         FrameQualityMetrics if successfully decoded, None if unreadable or corrupted.
     """
-    path_obj = Path(image_path)
-    if not path_obj.exists():
-        logger.warning(f"Image file does not exist: {path_obj}")
-        return None
+    if isinstance(image_input, np.ndarray):
+        img = image_input
+        if img is None or img.size == 0:
+            return None
+    else:
+        path_obj = Path(image_input)
+        if not path_obj.exists():
+            logger.warning(f"Image file does not exist: {path_obj}")
+            return None
 
-    img = cv2.imread(str(path_obj))
-    if img is None or img.size == 0:
-        logger.warning(f"Failed to decode image: {path_obj}")
-        return None
+        img = cv2.imread(str(path_obj))
+        if img is None or img.size == 0:
+            logger.warning(f"Failed to decode image: {path_obj}")
+            return None
 
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Convert to grayscale if 3-channel
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    elif len(img.shape) == 2:
+        gray = img
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
 
     # Downscale preserving aspect ratio for fast Laplacian and ORB evaluation
     h, w = gray.shape[:2]
