@@ -186,11 +186,14 @@ class ZurichSequenceSource(ImageSource):
             timestamp_us = None
             timestamp_source = "missing"
 
-        # Obtain relative path from dataset_dir or absolute path
+        # Obtain relative path from repo cwd, dataset_dir, or absolute path
         try:
-            rel_path = str(img_path.relative_to(self.dataset_dir.parent))
+            rel_path = str(img_path.relative_to(Path.cwd()))
         except ValueError:
-            rel_path = str(img_path)
+            try:
+                rel_path = str(img_path.relative_to(self.dataset_dir))
+            except ValueError:
+                rel_path = str(img_path)
 
         return FrameRecord(
             frame_id=frame_id,

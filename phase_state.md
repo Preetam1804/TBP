@@ -80,3 +80,23 @@ Phase 2 keyframes.
 None.
 ### Next Actions
 Phase 2: KeyframeSelector.
+
+## Phase 2 Completed: 2026-09-14
+### Completed
+Quality metrics (blur/brightness/clipping/ORB); deterministic selector with overlap guard;
+'uav3d keyframes' CLI; keyframes.json + sfm/images/ + contact sheet on real data.
+### Files Created
+keyframes/{quality,selector}.py, tests/test_keyframes.py
+### Files Modified
+cli.py, config.py, configs/zurich_baseline.yaml
+### Decisions Made
+No optical-flow selection (deferred); min_blur=60.0 after inspecting metric distribution;
+symlink with copy fallback; overlap guard halves stride automatically.
+### Real-data Results
+considered=50, selected=25, final stride=2, blur median/p95=422.6/428.5 (min: 409.3), ORB features median/p95=172/178, clipping median/p95=0.28%/0.28%
+### Remaining Tasks
+Phase 3 SfM.
+### Current Blockers
+None.
+### Next Actions
+Phase 3: pycolmap SfM runner + poses.json.

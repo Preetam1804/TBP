@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
@@ -13,6 +14,7 @@ from rich.table import Table
 from uav3d import __version__
 from uav3d.config import load_config
 from uav3d.exceptions import Uav3dError
+from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
 from uav3d.sources.video import VideoFileSource
 from uav3d.sources.zurich import ZurichSequenceSource
@@ -123,6 +125,65 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_keyframes_command(args: argparse.Namespace) -> int:
+    """Execute the keyframes extraction and filtering command."""
+    logger = setup_logging()
+    cfg = load_config(args.config if os.path.exists(args.config) else None)
+    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+
+    with timed_stage("keyframes", logger=logger):
+        source_type = cfg.source.type.lower()
+        if source_type == "zurich":
+            dataset_path = Path(args.data_dir) if args.data_dir else Path(cfg.source.dataset_dir)
+            if not dataset_path.is_absolute():
+                dataset_path = (Path(data_dir).parent / dataset_path).resolve() if not dataset_path.exists() else dataset_path.resolve()
+            source = ZurichSequenceSource(
+                dataset_dir=dataset_path,
+                start_id=cfg.source.start_id,
+                count=cfg.source.count,
+                stride=cfg.source.stride,
+            )
+        elif source_type == "video":
+            video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4"))
+            source = VideoFileSource(video_path=video_path)
+        else:
+            raise Uav3dError(f"Unsupported source type '{source_type}'. Must be 'zurich' or 'video'.")
+
+        timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
+
+        selector = KeyframeSelector(config=cfg.keyframes)
+        summary = selector.select(source=source, output_dir=run_dir, dataset_label=cfg.dataset_label)
+
+        table = Table(title=f"Keyframe Extraction Summary: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
+        table.add_column("Metric / Property", style="bold white", width=28)
+        table.add_column("Value", style="green")
+
+        table.add_row("Frames Evaluated", str(summary.considered_count))
+        table.add_row("Keyframes Selected", f"[bold green]{summary.selected_count}[/bold green]")
+        table.add_row("Decode Failures", str(summary.decode_failed_count))
+        table.add_row("Initial Stride", str(summary.initial_stride))
+        table.add_row("Final Stride", f"{summary.final_stride} (reductions: {summary.stride_reductions})")
+        table.add_row(
+            "Blur Score (med / p95)",
+            f"{summary.blur_dist.median_val:.1f} / {summary.blur_dist.p95_val:.1f} (min: {summary.blur_dist.min_val:.1f})",
+        )
+        table.add_row(
+            "ORB Features (med / p95)",
+            f"{summary.features_dist.median_val:.0f} / {summary.features_dist.p95_val:.0f} (min: {summary.features_dist.min_val:.0f})",
+        )
+        table.add_row(
+            "Clipping Ratio (med / p95)",
+            f"{summary.clipping_dist.median_val*100:.2f}% / {summary.clipping_dist.p95_val*100:.2f}%",
+        )
+        table.add_row("Keyframes JSON", str(summary.keyframes_json_path))
+        table.add_row("SfM Images Directory", str(summary.sfm_images_dir))
+        table.add_row("Contact Sheet", str(summary.contact_sheet_path))
+
+        console.print(table)
+    return 0
+
+
 def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
     """Execute stub for unimplemented pipeline stage."""
     logger = setup_logging()
@@ -206,6 +267,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "inspect":
             return _handle_inspect_command(args)
+        if args.command == "keyframes":
+            return _handle_keyframes_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()

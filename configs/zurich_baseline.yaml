@@ -20,8 +20,11 @@ ingest:
 keyframes:
   strategy: "laplacian_variance"
   stride: 2
-  sharpness_threshold: 100.0
-  target_count: 150
+  max_frames: 250
+  min_blur: 60.0
+  max_clipping: 0.05
+  max_gap: 15
+  orb_features: 2000
 
 sfm:
   camera_model: "PINHOLE"

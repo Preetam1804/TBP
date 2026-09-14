@@ -16,10 +16,11 @@ def fake_zurich_dataset(tmp_path: Path) -> Path:
     images_dir.mkdir(parents=True)
     logs_dir.mkdir(parents=True)
 
-    # 1. Create 5 sample frame images (1080p black frames with noise)
-    img_data = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    # 1. Create 5 sample frame images (1080p with normal mid-tone values and contrast edges)
+    img_data = np.full((1080, 1920, 3), 128, dtype=np.uint8)
+    for x in range(0, 1920, 60):
+        img_data[:, x : x + 30] = 180
     for i in range(5):
-        # Frame names matching Zurich format (e.g. frame_00000.jpg, frame_00001.jpg)
         img_path = images_dir / f"frame_{i:05d}.jpg"
         cv2.imwrite(str(img_path), img_data)
 

@@ -12,6 +12,9 @@ class KeyframeRecord(BaseModel):
     timestamp_us: int | None = Field(default=None, description="Frame timestamp in integer microseconds, or None")
     file_path: str = Field(..., description="Relative or absolute path to keyframe image")
     score: float | None = Field(default=None, description="Optional keyframe selection quality score")
+    selected: bool = Field(default=True, description="Whether this frame was selected as keyframe")
+    selection_reason: str | None = Field(default=None, description="Reason for selection or rejection")
+    metrics: dict[str, float] | None = Field(default=None, description="Computed quality metrics for this frame")
 
 
 class KeyframesFile(BaseModel):

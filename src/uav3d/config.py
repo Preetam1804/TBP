@@ -26,9 +26,14 @@ class KeyframeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     strategy: str = Field(default="laplacian_variance", description="Selection algorithm")
-    stride: int = Field(default=2, ge=1, description="Frame sampling stride")
-    sharpness_threshold: float = Field(default=100.0, ge=0.0, description="Laplacian variance threshold")
-    target_count: int = Field(default=150, gt=0, description="Target number of keyframes")
+    stride: int = Field(default=2, ge=1, description="Temporal subsampling stride")
+    max_frames: int = Field(default=250, gt=0, description="Maximum number of keyframes to select")
+    min_blur: float = Field(default=60.0, ge=0.0, description="Minimum Laplacian variance blur score threshold")
+    max_clipping: float = Field(default=0.05, ge=0.0, le=1.0, description="Maximum allowed pixel clipping ratio")
+    max_gap: int = Field(default=15, ge=1, description="Maximum allowed source frame index gap between consecutive keyframes")
+    orb_features: int = Field(default=2000, gt=0, description="Maximum ORB feature count cap")
+    sharpness_threshold: float | None = Field(default=None, description="Optional alias for min_blur")
+    target_count: int | None = Field(default=None, description="Optional alias for max_frames")
 
 
 class SfmConfig(BaseModel):
