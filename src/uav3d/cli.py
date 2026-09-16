@@ -12,11 +12,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from uav3d import __version__
+from uav3d.calibration import estimate_video_calibration, scale_calibration
 from uav3d.config import PipelineConfig, load_config
 from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
-from uav3d.models.frames import CameraCalibration
 from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
 from uav3d.sfm import SfmRunner, export_poses
@@ -33,7 +33,6 @@ from uav3d.validation import (
 console = Console()
 err_console = Console(stderr=True)
 
-SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate")
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -95,8 +94,10 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
 
     with timed_stage("inspect", logger=logger):
-        source_type = cfg.source.type.lower()
         source = _build_source(cfg, data_dir, args)
+        # Report the type of the source actually opened, not the configured default.
+        source_type = "video" if isinstance(source, VideoFileSource) else cfg.source.type.lower()
+        dataset_label = _resolve_dataset_label(cfg, source)
         meta = source.metadata()
         calib = source.calibration()
 
@@ -143,10 +144,18 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
             if alts:
                 table.add_row("Altitude Range (m)", f"[{min(alts):.2f}, {max(alts):.2f}]")
 
+        # Surface the calibration provenance explicitly: for uncalibrated video the
+        # focal length is an assumption, not a measurement.
+        if isinstance(source, VideoFileSource):
+            table.add_row(
+                "Intrinsics Provenance",
+                "[yellow]assumed FoV (no embedded calibration); focal refinement gated[/yellow]",
+            )
+
         console.print(table)
         console.print(
             Panel.fit(
-                "[bold yellow]Dataset Label:[/bold yellow] replayed public dataset\n"
+                f"[bold yellow]Dataset Label:[/bold yellow] {dataset_label}\n"
                 "[dim]Ground truth positions (GroundTruthAGL.csv) are stored for evaluation only and never used in SfM.[/dim]",
                 border_style="yellow",
             )
@@ -165,13 +174,15 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
 
+        dataset_label = _resolve_dataset_label(cfg, source)
         selector = KeyframeSelector(config=cfg.keyframes)
-        summary = selector.select(source=source, output_dir=run_dir, dataset_label=cfg.dataset_label)
+        summary = selector.select(source=source, output_dir=run_dir, dataset_label=dataset_label)
 
         table = Table(title=f"Keyframe Extraction Summary: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
         table.add_column("Metric / Property", style="bold white", width=28)
         table.add_column("Value", style="green")
 
+        table.add_row("Dataset Label", dataset_label)
         table.add_row("Frames Evaluated", str(summary.considered_count))
         table.add_row("Keyframes Selected", f"[bold green]{summary.selected_count}[/bold green]")
         table.add_row("Decode Failures", str(summary.decode_failed_count))
@@ -234,7 +245,8 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         timestamps_map = {kf.frame_id: kf.timestamp_us for kf in kf_file.keyframes}
 
         # 3. Obtain camera calibration
-        # Check actual image dimensions in images_dir to avoid Zurich calibration mismatch
+        # Read the actual image dimensions in images_dir so the calibration matches
+        # the pixels that SfM will actually see.
         actual_width, actual_height = None, None
         if all_image_names:
             first_img_path = images_dir / all_image_names[0]
@@ -245,34 +257,54 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
                 if sample_mat is not None:
                     actual_height, actual_width = sample_mat.shape[:2]
 
+        source = _build_source(cfg, data_dir, args)
+        dataset_label = _resolve_dataset_label(cfg, source)
         is_video_run = (
-            any(name.startswith("video_") for name in all_image_names)
-            or getattr(args, "video", None) is not None
+            isinstance(source, VideoFileSource)
+            or any(name.startswith("video_") for name in all_image_names)
             or cfg.source.type.lower() == "video"
         )
 
-        if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
+        focal_override = getattr(args, "focal_px", None) or cfg.sfm.video_focal_px
+
+        if is_video_run:
+            # Video files carry no trustworthy intrinsics, so the focal length is
+            # either supplied explicitly or assumed from a configured FoV. The
+            # model is SIMPLE_PINHOLE so bundle adjustment cannot split fx and fy
+            # apart (which previously produced physically impossible cameras).
             w = actual_width or 1920
             h = actual_height or 1080
-            fx = fy = float(w) * 0.9
-            cx = float(w) / 2.0
-            cy = float(h) / 2.0
-            calibration = CameraCalibration(
-                model="PINHOLE",
+            calibration = estimate_video_calibration(
                 width=w,
                 height=h,
-                params=[fx, fy, cx, cy],
-                source=f"auto_video_{w}x{h}",
+                fov_deg=cfg.sfm.video_fov_deg,
+                focal_px=focal_override,
+                source_note="cli",
             )
-            cfg.sfm.camera_model = "PINHOLE"
-            cfg.sfm.refine_intrinsics = True
-            logger.info(
-                f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
-                f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
-            )
+            cfg.sfm.camera_model = calibration.model
+            if focal_override is not None:
+                cfg.sfm.refine_intrinsics = False
+                logger.info(
+                    f"Video run with explicit focal length: SIMPLE_PINHOLE f={focal_override:.1f} px "
+                    f"({calibration.width}x{calibration.height}); intrinsics locked (not refined)."
+                )
+            else:
+                cfg.sfm.refine_intrinsics = True
+                logger.info(
+                    f"Video run with assumed {cfg.sfm.video_fov_deg:.1f} deg horizontal FoV: "
+                    f"SIMPLE_PINHOLE f={calibration.params[0]:.1f} px ({w}x{h}). Focal refinement will be "
+                    f"attempted and kept only if the result stays within "
+                    f"[{cfg.sfm.video_min_fov_deg:.0f}, {cfg.sfm.video_max_fov_deg:.0f}] deg."
+                )
         else:
-            source = _build_source(cfg, data_dir, args)
             calibration = source.calibration()
+            if actual_width and actual_height and (actual_width, actual_height) != (
+                calibration.width,
+                calibration.height,
+            ):
+                # Frames on disk differ from the calibration resolution: rescale the
+                # real calibration instead of discarding it for an invented pinhole.
+                calibration = scale_calibration(calibration, actual_width, actual_height)
             logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
 
         # 4. Optional CLI overrides
@@ -290,9 +322,12 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
             all_image_names=all_image_names,
             camera_calibration=calibration,
             output_path=poses_path,
-            dataset_label=cfg.dataset_label,
+            dataset_label=dataset_label,
             scale_factor=1.0,
             timestamps_map=timestamps_map,
+            intrinsics_locked=not result.intrinsics_refined,
+            initial_params=result.initial_params if result.intrinsics_refined else None,
+            horizontal_fov_deg=result.final_fov_deg,
         )
 
         # 7. Print summary table
@@ -326,12 +361,39 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         table.add_row("Poses File", str(poses_path))
         table.add_row("COLMAP Database", str(result.database_path))
         table.add_row("Sparse Reconstruction", str(result.sparse_dir))
-        table.add_row(
-            "Intrinsics Locked",
-            f"{poses_file.camera.params if poses_file.camera else calibration.params}",
-        )
+        final_params = poses_file.camera.params if poses_file.camera else calibration.params
+        fov_note = f", hFoV={result.final_fov_deg:.1f} deg" if result.final_fov_deg else ""
+        if result.refinement_rejected:
+            table.add_row(
+                "Intrinsics (refinement REJECTED)",
+                f"[green]{final_params}[/green] (locked at supplied values{fov_note})",
+            )
+        elif result.intrinsics_refined:
+            table.add_row(
+                "Intrinsics (REFINED by BA)",
+                f"[yellow]{final_params}[/yellow] "
+                f"(initial {result.initial_params}{fov_note})",
+            )
+        else:
+            table.add_row(
+                "Intrinsics (LOCKED)",
+                f"[green]{final_params}[/green]{fov_note}",
+            )
 
         console.print(table)
+
+        if result.refinement_rejected:
+            console.print(
+                "[yellow]Focal-length refinement produced an implausible camera and was discarded:[/yellow] "
+                + "; ".join(result.intrinsics_violations)
+                + "\n[dim]The reconstruction was redone with the supplied intrinsics locked. Pass "
+                "--focal-px with a known focal length for a measured camera instead of an assumed one.[/dim]"
+            )
+        elif result.intrinsics_violations:
+            console.print(
+                "[yellow]Intrinsics warnings (allow_unbounded_intrinsics=True):[/yellow] "
+                + "; ".join(result.intrinsics_violations)
+            )
 
         if result.registration_rate < 0.85:
             console.print(
@@ -388,13 +450,20 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
             raw_telemetry = source._gps_records
 
         # 4. Perform synchronization
+        # Resolve the mode from the source actually in use rather than relying on
+        # frame-id heuristics, so a video run can never be reported as a
+        # dataset image-ID join it did not perform.
         sync_mode = getattr(args, "mode", "auto")
+        if sync_mode == "auto":
+            sync_mode = "zurich" if isinstance(source, ZurichSequenceSource) else "video"
+        logger.info(f"Telemetry synchronization mode: {sync_mode}")
         synchronizer = TelemetrySynchronizer(config=cfg.sync)
         tel_file, poses_enriched = synchronizer.sync(
             poses=poses_file,
             keyframes=kf_file,
             raw_telemetry=raw_telemetry,
-            dataset_label=cfg.dataset_label,
+            manifest_path=Path(data_dir) / "interim" / "manifest.json",
+            dataset_label=_resolve_dataset_label(cfg, source),
             mode=sync_mode,
         )
 
@@ -464,20 +533,51 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         if not poses_path.exists():
             raise Uav3dError(f"poses.json does not exist in {run_dir}. Run 'uav3d sfm' first.")
 
-        # 2. Resolve ground truth file
+        # 2. Load poses.json (needed before ground truth resolution, because the
+        # run's frame-id namespace determines whether auto-discovery is safe)
+        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
+
+        frame_ids = [p.frame_id for p in poses_file.poses]
+        is_dataset_run = bool(frame_ids) and all(fid.startswith("zurich_") for fid in frame_ids)
+        run_namespace = "zurich_dataset_sequence" if is_dataset_run else "video_or_other"
+        logger.info(f"Run frame-id namespace: {run_namespace} (sample: {frame_ids[:1]})")
+
+        # 3. Resolve ground truth file
+        # Auto-discovery is only permitted for dataset-sequence runs. For any other
+        # run (e.g. an arbitrary video) picking up a CSV that happens to sit under
+        # the data directory would silently grade the trajectory against unrelated
+        # ground truth, so an explicit --gt-file is required.
         gt_file = None
+        gt_selection = "explicit_cli_argument"
         if getattr(args, "gt_file", None):
             gt_file = Path(args.gt_file).resolve()
+            if not gt_file.exists():
+                raise Uav3dError(f"Ground truth file passed with --gt-file does not exist: {gt_file}")
+        elif not is_dataset_run:
+            raise Uav3dError(
+                f"Run '{run_dir.name}' has frame ids in the '{run_namespace}' namespace, which carries no "
+                "ground-truth definition. Refusing to auto-select a GroundTruthAGL.csv under the data "
+                "directory because it would belong to a different dataset. Pass --gt-file explicitly if "
+                "you know the correct ground truth for this run."
+            )
         else:
-            candidates = [
-                Path(data_dir) / "raw" / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
-                Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
-                Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
-            ]
-            for c in candidates:
-                if c.exists():
-                    gt_file = c
-                    break
+            # Dataset run: ask the source adapter where its own ground truth lives
+            # rather than guessing fixed directory layouts.
+            gt_selection = "auto_discovered_from_source"
+            source = _build_source(cfg, data_dir, args)
+            source_gt = getattr(source, "gt_file", None)
+            if isinstance(source_gt, Path) and source_gt.is_file():
+                gt_file = source_gt
+            else:
+                candidates = [
+                    Path(data_dir) / "raw" / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
+                    Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
+                    Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
+                ]
+                for c in candidates:
+                    if c.exists():
+                        gt_file = c
+                        break
 
         if gt_file is None or not gt_file.exists():
             raise Uav3dError(
@@ -485,17 +585,27 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
                 "Please specify path with --gt-file."
             )
 
-        logger.info(f"Using ground truth file: {gt_file}")
-
-        # 3. Load poses.json
-        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
+        logger.info(f"Using ground truth file: {gt_file} (selection: {gt_selection})")
+        if gt_selection.startswith("auto_discovered"):
+            console.print(
+                "[yellow]Note:[/yellow] ground truth was auto-discovered under the data directory "
+                f"({gt_file}); pass --gt-file to pin it explicitly."
+            )
 
         # 4. Compute ATE metrics and alignment
         ate_report = compute_ate(
             poses_file=poses_file,
             gt_records=gt_file,
-            ate_threshold_m=5.0,
-            dataset_label=cfg.dataset_label,
+            ate_threshold_m=cfg.validation.ate_threshold_meters,
+            # Prefer the provenance recorded by the run itself: it is the label that
+            # was attached when the poses were produced.
+            dataset_label=poses_file.dataset_label or _resolve_dataset_label(cfg, None),
+            gt_provenance={
+                "file": str(gt_file),
+                "selection": gt_selection,
+                "run_frame_id_namespace": run_namespace,
+                "alignment": cfg.validation.alignment,
+            },
         )
 
         # 5. Export ate_report.json
@@ -519,8 +629,11 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         table.add_column("Value", style="green")
 
         m = ate_report.metrics
+        gt_info = ate_report.ground_truth or {}
         table.add_row("Run Directory", str(run_dir))
         table.add_row("Dataset Provenance", ate_report.dataset_label)
+        table.add_row("Ground Truth File", str(gt_info.get("file", "unknown")))
+        table.add_row("Ground Truth Selection", str(gt_info.get("selection", "unknown")))
         table.add_row("Matched Frames (SfM & GT)", f"{m.num_matched_frames} / {m.num_registered_frames}")
 
         cond_color = "yellow" if m.fit_condition != "ok" else "green"
@@ -538,25 +651,27 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
             reproj_style = "bold green" if m.mean_reprojection_error_px <= 1.5 else "bold red"
             table.add_row("Reprojection Error (KPI <= 1.5px)", f"[{reproj_style}]{m.mean_reprojection_error_px:.3f} px[/{reproj_style}]")
 
-        table.add_row("Validation Status", f"[bold green]{ate_report.status.upper()}[/bold green]")
+        if ate_report.status == "completed":
+            table.add_row("Validation Status", f"[bold green]{ate_report.status.upper()}[/bold green]")
+        else:
+            table.add_row("Validation Status", f"[bold yellow]{ate_report.status.upper()}[/bold yellow]")
         table.add_row("Report Artifacts", f"ate_report.json, SP1_REPORT.md, {', '.join(plots.values())}")
 
         console.print(table)
     return 0
 
 
-def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
-    """Execute stub for unimplemented pipeline stage."""
-    logger = setup_logging()
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+def _resolve_dataset_label(cfg: PipelineConfig, source: object | None) -> str:
+    """Return the provenance label for a source, downgrading locally generated data.
 
-    with timed_stage(command_name, logger=logger):
-        console.print(
-            f"[yellow]Stage '[bold]{command_name}[/bold]' is not implemented yet.[/yellow] "
-            f"(Target data directory: [cyan]{data_dir}[/cyan])"
-        )
-    return 0
+    ``ZurichSequenceSource`` exposes ``dataset_label()``, which appends a warning
+    suffix when the dataset directory carries a synthetic-sample marker. This
+    keeps sample-data runs from ever being labelled as real dataset results.
+    """
+    labeller = getattr(source, "dataset_label", None)
+    if callable(labeller):
+        return str(labeller(cfg.dataset_label))
+    return cfg.dataset_label
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -610,6 +725,15 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override sequential matching overlap window",
+    )
+    sfm_parser.add_argument(
+        "--focal-px",
+        type=float,
+        default=None,
+        help=(
+            "Known focal length in pixels for video runs. Locks intrinsics instead of "
+            "assuming a field of view and refining the focal length"
+        ),
     )
 
     # 4. sync
@@ -673,14 +797,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_sync_command(args)
         if args.command == "validate":
             return _handle_validate_command(args)
-        if args.command in SUBCOMMANDS:
-            return _handle_stub_command(args.command, args)
         parser.print_help()
         return 1
     except Uav3dError as exc:
         err_console.print(f"[bold red]Error:[/bold red] {exc}")
         return 1
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         err_console.print(f"[bold red]Unexpected failure:[/bold red] {exc}")
         return 2
 

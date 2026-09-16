@@ -1,6 +1,5 @@
 """Report and visualization generators for SP-1 ATE validation."""
 
-import json
 import logging
 from pathlib import Path
 
@@ -169,9 +168,19 @@ def generate_sp1_report(
     kpi_reg_pass = m.registration_rate is not None and m.registration_rate >= 0.85
     kpi_reproj_pass = m.mean_reprojection_error_px is not None and m.mean_reprojection_error_px <= 1.5
 
+    # The ATE KPI must be measured against the configured threshold, not assumed.
+    ate_threshold = float(report.ground_truth.get("ate_threshold_m", 5.0))
+    kpi_ate_pass = m.rmse_m <= ate_threshold
+
+    num_total = m.num_total_frames if m.num_total_frames is not None else m.num_registered_frames
+    gt_info = report.ground_truth or {}
+    gt_file = str(gt_info.get("file", "unspecified"))
+    gt_selection = str(gt_info.get("selection", "unspecified"))
+
     content = f"""# SP-1 Metrics & Trajectory Validation Report
 
-> **Dataset Provenance**: `{report.dataset_label}`  
+> **Dataset Provenance**: `{report.dataset_label}`<br>
+> **Ground Truth Source**: `{gt_file}` (selection: `{gt_selection}`)<br>
 > **Evaluation Mode**: Ground Truth consumed exclusively for post-reconstruction validation. Never consumed by visual SfM or keyframing stages.
 
 ---
@@ -180,9 +189,10 @@ def generate_sp1_report(
 
 | Primary Metric / KPI | Benchmark Target | Achieved Pipeline Value | Status |
 | :--- | :--- | :--- | :--- |
-| **SfM Keyframe Registration Rate** | $\\ge 85.0\\%$ | **{reg_rate_str}** ({m.num_registered_frames}/{m.num_registered_frames}) | {'**PASSED**' if kpi_reg_pass else '**FAILED**'} |
+| **SfM Keyframe Registration Rate** | $\\ge 85.0\\%$ | **{reg_rate_str}** ({m.num_registered_frames}/{num_total}) | {'**PASSED**' if kpi_reg_pass else '**FAILED**'} |
 | **Mean Reprojection Error** | $\\le 1.500\\text{{ px}}$ | **{reproj_str}** | {'**PASSED**' if kpi_reproj_pass else '**FAILED**'} |
-| **Absolute Trajectory Error (RMSE)** | $\\le 5.000\\text{{ m}}$ | **{m.rmse_m:.3f} m** | **PASSED** |
+| **Absolute Trajectory Error (RMSE)** | $\\le {ate_threshold:.3f}\\text{{ m}}$ | **{m.rmse_m:.3f} m** | {'**PASSED**' if kpi_ate_pass else '**FAILED**'} |
+| **Validation Status** | `completed` | **{report.status}** | {'OK' if report.status == 'completed' else 'Review'} |
 | **Sim(3) Alignment Condition** | `well_conditioned` | **{m.fit_condition}** | {'Normal' if m.fit_condition == 'well_conditioned' else 'Warning (Collinear corridor)'} |
 
 ---
@@ -235,7 +245,7 @@ Similarity transformation optimal parameters ($C_{{gt}} \\approx s \\cdot R \\cd
 1. **Rolling Shutter Distortion Uncorrected**:
    - The GoPro Hero4 camera sensor utilizes a rolling shutter. During rapid translational and yaw accelerations, slight spatial distortion occurs that is not parameterized in the global pinhole/OPENCV projection model.
 2. **GPS Multipath & Consumer Receiver Noise**:
-   - Single-frequency onboard GPS logs (`OnbordGPS.csv`) are subject to urban canyon multipath and atmospheric drift ($\\\\pm 2$–$5$ meters).
+   - Single-frequency onboard GPS logs (`OnbordGPS.csv`) are subject to urban canyon multipath and atmospheric drift ($\\\\pm 2$-to-$5$ meters).
 3. **Stride-Based Keyframing**:
    - Keyframe selection combines Laplacian variance blur filtering and uniform temporal striding with an overlap safety guard. Dense optical flow feature velocity gating is deferred to future optimization.
 4. **Flightline Collinearity**:

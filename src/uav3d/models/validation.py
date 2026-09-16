@@ -30,6 +30,10 @@ class AteMetrics(BaseModel):
     scale_factor: float = Field(..., description="Recovered Sim(3) similarity scale factor s from SfM to GT", gt=0.0)
     num_matched_frames: int = Field(..., description="Count of common frames evaluated between SfM and Ground Truth", ge=0)
     num_registered_frames: int = Field(..., description="Total registered SfM frames considered", ge=0)
+    num_total_frames: int | None = Field(
+        default=None,
+        description="Total keyframes fed into SfM, for honest registration-rate denominators",
+    )
     num_gt_frames: int = Field(..., description="Total ground truth frames available", ge=0)
     fit_condition: str = Field(
         ...,
@@ -50,6 +54,13 @@ class AteReport(BaseModel):
         description="Dataset provenance label",
     )
     status: str = Field(default="completed", description="Validation execution status")
+    ground_truth: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Provenance of the ground truth consumed: file path, how it was selected, how records "
+            "were matched to SfM frames, and the run-identity check result"
+        ),
+    )
     metrics: AteMetrics = Field(..., description="Summary ATE metrics")
     alignment_transform: dict[str, Any] = Field(
         ...,

@@ -10,13 +10,13 @@ Provides two distinct synchronization modes:
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
 from uav3d.config import SyncConfig
-from uav3d.exceptions import DataError, Uav3dError
 from uav3d.models.keyframes import KeyframeRecord, KeyframesFile
 from uav3d.models.poses import PoseRecord, PosesFile
 from uav3d.models.telemetry import TelemetryFile, TelemetryRecord
@@ -40,7 +40,9 @@ def haversine_distance_m(lat1: float, lon1: float, alt1: float | None, lat2: flo
 
 def recommend_crs(latitudes: Sequence[float], longitudes: Sequence[float]) -> str:
     """Compute recommended CRS (UTM zone or local ENU) via pyproj from coordinate centroid."""
-    valid_coords = [(lat, lon) for lat, lon in zip(latitudes, longitudes) if lat is not None and lon is not None]
+    valid_coords = [
+        (lat, lon) for lat, lon in zip(latitudes, longitudes, strict=False) if lat is not None and lon is not None
+    ]
     if not valid_coords:
         return "local ENU (no GPS coordinates available)"
 
@@ -153,12 +155,14 @@ class TelemetrySynchronizer:
         elif mode == "video":
             is_zurich = False
         else:
-            # Auto-detect from frame IDs
+            # Auto-detect from frame IDs.
+            #
+            # Mode A joins strictly on the dataset's source_image_id, so it is
+            # only safe when every frame genuinely comes from the Zurich
+            # sequence ("zurich_<id>"). Requiring the prefix avoids treating a
+            # video run ("video_000000") as if it were a dataset image-ID join.
             sample_ids = [p.frame_id for p in poses.poses[:5]]
-            if any(fid.startswith("zurich_") for fid in sample_ids):
-                is_zurich = True
-            elif sample_ids and re.search(r"(\d+)$", sample_ids[0]):
-                is_zurich = True
+            is_zurich = bool(sample_ids) and all(fid.startswith("zurich_") for fid in sample_ids)
 
         if is_zurich:
             return self._sync_mode_a_zurich(
@@ -200,6 +204,14 @@ class TelemetrySynchronizer:
                     match = re.search(r"(\d+)$", item.frame_id)
                     if match:
                         gps_by_id[int(match.group(1))] = item
+
+        if not gps_by_id:
+            # No telemetry at all (e.g. a video run): do not claim an image-ID
+            # mapping that never happened.
+            logger.warning("Mode A: no telemetry records supplied; emitting unsynchronized output.")
+            return self._build_unsynchronized_output(
+                poses, dataset_label, "No telemetry records available for image-ID mapping"
+            )
 
         telemetry_records: list[TelemetryRecord] = []
         enriched_poses: list[PoseRecord] = []
@@ -281,19 +293,30 @@ class TelemetrySynchronizer:
         total_frames = len(poses.poses)
         match_rate = float(matched_count / max(1, total_frames))
 
+        # Report partial coverage honestly rather than claiming a full ID mapping
+        # when a significant share of frames had no telemetry row.
+        sync_status = "dataset_image_id_mapping"
+        if match_rate < self.config.min_match_rate:
+            sync_status = "partial_telemetry_coverage"
+            logger.warning(
+                f"Mode A: only {matched_count}/{total_frames} frames ({match_rate * 100:.1f}%) had a "
+                f"telemetry row, below the {self.config.min_match_rate * 100:.0f}% threshold; "
+                f"sync_status='{sync_status}'."
+            )
+
         summary = {
             "mode": "Mode A (Zurich image-ID join)",
             "total_frames": total_frames,
             "matched_telemetry_frames": matched_count,
             "match_rate": round(match_rate, 4),
             "offset_us": None,
-            "sync_status": "dataset_image_id_mapping",
+            "sync_status": sync_status,
         }
 
         telemetry_file = TelemetryFile(
             schema_version="1.0.0",
             dataset_label=dataset_label,
-            sync_status="dataset_image_id_mapping",
+            sync_status=sync_status,
             offset_estimation="not_applicable",
             offset_us=None,
             recommended_crs=crs_rec,
@@ -314,7 +337,7 @@ class TelemetrySynchronizer:
 
         logger.info(
             f"Mode A Sync complete: {matched_count}/{total_frames} frames mapped "
-            f"({match_rate*100:.1f}%), status='dataset_image_id_mapping'"
+            f"({match_rate * 100:.1f}%), status='{sync_status}'"
         )
 
         return telemetry_file, poses_enriched
@@ -412,7 +435,7 @@ class TelemetrySynchronizer:
 
         enriched_poses: list[PoseRecord] = []
 
-        for pose, s_ts in zip(frame_poses, shifted_frame_ts):
+        for pose, s_ts in zip(frame_poses, shifted_frame_ts, strict=True):
             idx = int(np.argmin(np.abs(tel_ts - s_ts)))
             residual = int(tel_ts[idx] - s_ts)
 

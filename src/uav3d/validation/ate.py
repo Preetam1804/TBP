@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from uav3d.exceptions import DataError, Uav3dError
+from uav3d.exceptions import Uav3dError
 from uav3d.models.poses import PosesFile
 from uav3d.models.validation import AteMetrics, AteReport, PerFrameAte
 from uav3d.telemetry.zurich_parser import ZurichGroundTruthRecord, parse_ground_truth_agl
@@ -122,10 +122,7 @@ def check_flightline_geometry(gt_points: np.ndarray) -> tuple[str, dict[str, flo
 
     # If cross-track horizontal spread is < 5% of longitudinal flightline spread
     # or secondary eigenvalue is < 0.5 m^2 (sub-meter cross-track dispersion)
-    if aspect_ratio_21 < 0.05 or lam2 < 0.5:
-        condition = "weak_flightline_geometry"
-    else:
-        condition = "ok"
+    condition = "weak_flightline_geometry" if (aspect_ratio_21 < 0.05 or lam2 < 0.5) else "ok"
 
     stats = {
         "primary_eigenval": lam1,
@@ -142,6 +139,7 @@ def compute_ate(
     gt_records: dict[int, ZurichGroundTruthRecord] | Path | str,
     ate_threshold_m: float = 5.0,
     dataset_label: str = "replayed public dataset (Zurich Urban MAV) — not field-flight validation",
+    gt_provenance: dict[str, Any] | None = None,
 ) -> AteReport:
     """Compute Absolute Trajectory Error (ATE) metrics against ground truth.
 
@@ -153,6 +151,8 @@ def compute_ate(
         gt_records: Ground truth records dict or path to GroundTruthAGL.csv.
         ate_threshold_m: Warning threshold for ATE RMSE in meters.
         dataset_label: Provenance label for report.
+        gt_provenance: Optional dict describing where the ground truth came from
+            and how it was matched, persisted into the report for auditability.
 
     Returns:
         Validated AteReport instance.
@@ -249,6 +249,7 @@ def compute_ate(
         scale_factor=round(s, 4),
         num_matched_frames=matched_count,
         num_registered_frames=len(poses_file.poses),
+        num_total_frames=poses_file.metrics.num_images_total if poses_file.metrics else None,
         num_gt_frames=len(parsed_gt),
         fit_condition=fit_condition,
         registration_rate=reg_rate,
@@ -263,10 +264,24 @@ def compute_ate(
         "geometry_stats": geom_stats,
     }
 
+    provenance = dict(gt_provenance or {})
+    provenance.setdefault("num_gt_records_parsed", len(parsed_gt))
+    provenance.setdefault("match_rule", "trailing integer of frame_id == ground truth image_id")
+    provenance["ate_threshold_m"] = float(ate_threshold_m)
+    provenance["threshold_exceeded"] = bool(rmse_m > ate_threshold_m)
+
+    status = "completed"
+    if rmse_m > ate_threshold_m:
+        status = "completed_threshold_exceeded"
+        logger.warning(
+            f"ATE RMSE {rmse_m:.4f} m exceeds the configured warning threshold of {ate_threshold_m:.4f} m."
+        )
+
     report = AteReport(
         schema_version="1.0.0",
         dataset_label=dataset_label,
-        status="completed",
+        status=status,
+        ground_truth=provenance,
         metrics=metrics,
         alignment_transform=alignment_dict,
         per_frame_errors=per_frame_records,
