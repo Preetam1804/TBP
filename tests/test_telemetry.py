@@ -5,7 +5,6 @@ import json
 import random
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from uav3d.config import SyncConfig
@@ -352,3 +351,81 @@ class TestSyncCliAndImmutability:
         loaded_enriched = PosesFile.model_validate_json((run_dir / "poses_enriched.json").read_text(encoding="utf-8"))
         assert loaded_enriched == poses_enriched
 
+
+class TestSyncStatusHonesty:
+    """Regression tests: sync_status must describe what actually happened."""
+
+    @pytest.fixture
+    def video_poses_file(self) -> PosesFile:
+        """A PosesFile whose frames come from a video file, not the dataset."""
+        poses = [
+            PoseRecord(
+                frame_id=f"video_{i:06d}",
+                timestamp_us=i * 200000,
+                qw=1.0,
+                qx=0.0,
+                qy=0.0,
+                qz=0.0,
+                tx=float(i),
+                ty=0.0,
+                tz=5.0,
+                camera_center_world=[float(-i), 0.0, -5.0],
+                num_observations=120,
+                registered=True,
+            )
+            for i in range(5)
+        ]
+        return PosesFile(
+            schema_version="1.0.0",
+            dataset_label="replayed public dataset",
+            coordinate_frame="cam_from_world",
+            poses=poses,
+            unregistered_frames=[],
+        )
+
+    def test_video_run_never_reports_image_id_mapping(self, video_poses_file: PosesFile) -> None:
+        """Regression: video_* frame ids previously auto-selected Mode A.
+
+        The run reported sync_status='dataset_image_id_mapping' with 0/5 frames
+        matched, claiming an image-ID join that never took place.
+        """
+        sync = TelemetrySynchronizer()
+        tel_file, _ = sync.sync(poses=video_poses_file, raw_telemetry=None)
+
+        assert tel_file.sync_status != "dataset_image_id_mapping"
+        assert tel_file.sync_status == "unsynchronized"
+        assert tel_file.offset_estimation == "not_applicable"
+        assert tel_file.summary["matched_telemetry_frames"] == 0
+
+    def test_mode_a_without_telemetry_is_unsynchronized(self, sample_poses_file: PosesFile) -> None:
+        """Explicit Mode A with no telemetry records must not claim a mapping either."""
+        sync = TelemetrySynchronizer()
+        tel_file, poses_enriched = sync.sync(poses=sample_poses_file, raw_telemetry=None, mode="zurich")
+
+        assert tel_file.sync_status == "unsynchronized"
+        assert len(tel_file.records) == len(sample_poses_file.poses)
+        assert all(record.lat is None for record in tel_file.records)
+        assert all(p.telemetry_recorded is False for p in poses_enriched.poses)
+
+    def test_partial_coverage_is_flagged(self, sample_poses_file: PosesFile) -> None:
+        """Below the configured match threshold the status must say 'partial'."""
+        raw_telemetry = {
+            0: ZurichGpsRecord(1459425600000000, 0, 47.3769, 8.5417, 450.0, {}),
+            8: ZurichGpsRecord(1459425600800000, 8, 47.3770, 8.5418, 450.4, {}),
+        }
+        sync = TelemetrySynchronizer(config=SyncConfig(min_match_rate=0.8))
+        tel_file, _ = sync.sync(poses=sample_poses_file, raw_telemetry=raw_telemetry, mode="zurich")
+
+        assert tel_file.sync_status == "partial_telemetry_coverage"
+        assert tel_file.summary["match_rate"] == pytest.approx(0.4)
+
+    def test_full_coverage_keeps_dataset_mapping_status(self, sample_poses_file: PosesFile) -> None:
+        """A complete join still reports the dataset image-ID mapping."""
+        raw_telemetry = {
+            i * 2: ZurichGpsRecord(1459425600000000 + i * 200000, i * 2, 47.3769, 8.5417, 450.0 + i, {})
+            for i in range(5)
+        }
+        sync = TelemetrySynchronizer(config=SyncConfig(min_match_rate=0.8))
+        tel_file, _ = sync.sync(poses=sample_poses_file, raw_telemetry=raw_telemetry, mode="zurich")
+
+        assert tel_file.sync_status == "dataset_image_id_mapping"

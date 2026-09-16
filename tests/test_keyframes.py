@@ -185,19 +185,34 @@ class TestCliKeyframesCommand:
         assert exit_code == 0
 
     def test_keyframe_selection_from_video(self, tmp_path: Path) -> None:
-        """Verify that KeyframeSelector extracts and saves best frames from an MP4 video."""
+        """Verify that KeyframeSelector extracts and saves best frames from an MP4 video.
+
+        The video is generated inside the test so the suite carries no dependency
+        on a data/interim/synthetic.mp4 left over from a manual run.
+        """
         from uav3d.sources.video import VideoFileSource
 
-        video_path = Path("data/interim/synthetic.mp4")
-        if not video_path.exists():
-            pytest.skip("synthetic.mp4 not found")
+        video_path = tmp_path / "mini.mp4"
+        width, height, num_frames = 320, 240, 20
+        writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 5.0, (width, height))
+        assert writer.isOpened(), "OpenCV could not open an MP4 writer in this environment"
+        rng = np.random.default_rng(11)
+        for i in range(num_frames):
+            frame = np.full((height, width, 3), 40, dtype=np.uint8)
+            for _ in range(60):
+                x, y = int(rng.integers(5, width - 25)), int(rng.integers(5, height - 25))
+                frame[y : y + 8, x : x + 8] = rng.integers(0, 255, 3)
+            cv2.putText(frame, f"{i:03d}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            writer.write(frame)
+        writer.release()
+        assert video_path.stat().st_size > 0
 
         source = VideoFileSource(video_path=video_path)
         selector = KeyframeSelector(
             KeyframeConfig(
-                stride=10,
-                min_blur=10.0,
-                max_clipping=0.5,
+                stride=4,
+                min_blur=1.0,
+                max_clipping=0.9,
                 max_gap=20,
             )
         )

@@ -1,21 +1,17 @@
 """Tests for SfM export, conventions, locked intrinsics, and unregistered frame handling."""
 
-import json
 from pathlib import Path
 
+import cv2
 import numpy as np
-import pycolmap
 import pytest
 
-from uav3d.config import SfmConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.models.frames import CameraCalibration
 from uav3d.models.poses import PosesFile
 from uav3d.sfm.colmap_compat import (
     compute_camera_center,
     get_peak_rss_mb,
-    get_pose_components,
-    is_image_registered,
     quaternion_to_rotation_matrix,
 )
 from uav3d.sfm.colmap_export import export_poses
@@ -175,6 +171,65 @@ class TestSfmExport:
         assert poses_file.camera is not None
         assert poses_file.camera.model == "OPENCV"
         assert len(poses_file.camera.params) == 8
+        # Default export path represents a locked-intrinsics run and records provenance.
+        assert poses_file.camera.intrinsics_locked is True
+        assert poses_file.camera.initial_params is None
+        assert poses_file.camera.intrinsics_source == "calibration_data.npz"
+
+
+class TestCameraBlockProvenance:
+    """Verify poses.json never labels a refined camera as locked."""
+
+    def _reconstruction_with_camera(self, params: list[float]) -> object:
+        class DummyCamera:
+            def __init__(self, p: list[float]) -> None:
+                self.params = p
+                self.width = 1920
+                self.height = 1080
+                self.model = "PINHOLE"
+
+        class DummyReconstruction:
+            def __init__(self, cam: DummyCamera) -> None:
+                self.images = {}
+                self.cameras = {1: cam}
+
+            def compute_mean_reprojection_error(self) -> float:
+                return 0.5
+
+            def compute_mean_track_length(self) -> float:
+                return 3.0
+
+            def num_points3D(self) -> int:
+                return 10
+
+        return DummyReconstruction(DummyCamera(params))
+
+    def test_refined_run_records_initial_and_final_params(self, tmp_path: Path) -> None:
+        """A refined run must store both the initial and the final intrinsics."""
+        rec = self._reconstruction_with_camera([1662.0, 960.0, 540.0])
+        calib = CameraCalibration(
+            model="SIMPLE_PINHOLE",
+            width=1920,
+            height=1080,
+            params=[1662.77, 960.0, 540.0],
+            source="video_estimate_inspect_default_fov",
+        )
+        poses_file = export_poses(
+            reconstruction=rec,
+            all_image_names=[],
+            camera_calibration=calib,
+            output_path=tmp_path / "poses.json",
+            intrinsics_locked=False,
+            initial_params=[1662.77, 960.0, 540.0],
+            horizontal_fov_deg=60.0,
+        )
+
+        camera = poses_file.camera
+        assert camera is not None
+        assert camera.intrinsics_locked is False
+        assert camera.initial_params == [1662.77, 960.0, 540.0]
+        assert camera.params == [1662.0, 960.0, 540.0]
+        assert camera.horizontal_fov_deg == 60.0
 
 
 class TestSfmRunnerLogic:
@@ -199,3 +254,29 @@ class TestSfmRunnerLogic:
         rss = get_peak_rss_mb()
         assert isinstance(rss, float)
         assert rss >= 0.0
+
+    def test_calibration_param_count_mismatch_fails_fast(self, tmp_path: Path) -> None:
+        """Regression: OPENCV params with a 4-parameter model used to fail inside COLMAP.
+
+        COLMAP reported only "Invalid camera parameters"; the runner now rejects the
+        mismatch up front with the model, the count it needs and the values supplied.
+        """
+        images_dir = tmp_path / "images"
+        images_dir.mkdir()
+        rng = np.random.default_rng(3)
+        for i in range(2):
+            img = rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)
+            cv2.imwrite(str(images_dir / f"frame_{i:05d}.jpg"), img)
+
+        calib = CameraCalibration(
+            model="PINHOLE",  # PINHOLE requires 4 params, 8 are supplied
+            width=1920,
+            height=1080,
+            params=[1060.0, 1060.0, 960.0, 540.0, -0.05, 0.01, 0.0, 0.0],
+            source="test_mismatch",
+        )
+        with pytest.raises(Uav3dError) as exc:
+            SfmRunner().run(images_dir=images_dir, output_dir=tmp_path / "out", calibration=calib)
+        message = str(exc.value)
+        assert "PINHOLE" in message
+        assert "4 are required" in message

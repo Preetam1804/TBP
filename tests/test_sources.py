@@ -1,5 +1,6 @@
 """Tests for ZurichSequenceSource, VideoFileSource, and telemetry parsers."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -167,3 +168,49 @@ class TestInspectCliWithFixture:
         # Run inspect via CLI main
         exit_code = main(["inspect", "--config", str(config_path)])
         assert exit_code == 0
+
+
+class TestDatasetProvenanceLabelling:
+    """Regression: locally generated sample data must never be labelled as the real dataset."""
+
+    def test_plain_dataset_keeps_configured_label(self, fake_zurich_dataset: Path) -> None:
+        """A directory without a marker is treated as whatever the config says."""
+        source = ZurichSequenceSource(dataset_dir=fake_zurich_dataset, count=2)
+        assert source.provenance is None
+        assert source.dataset_label("replayed public dataset (Zurich Urban MAV)") == (
+            "replayed public dataset (Zurich Urban MAV)"
+        )
+
+    def test_synthetic_marker_overrides_label(self, fake_zurich_dataset: Path) -> None:
+        """A directory carrying the generator marker gets an explicit synthetic label."""
+        marker = fake_zurich_dataset / "dataset_provenance.json"
+        marker.write_text(
+            json.dumps({"kind": "synthetic_sample", "generator": "scripts/generate_sample_zurich.py"}),
+            encoding="utf-8",
+        )
+        source = ZurichSequenceSource(dataset_dir=fake_zurich_dataset, count=2)
+        label = source.dataset_label("replayed public dataset (Zurich Urban MAV)")
+
+        assert "synthetic sample dataset" in label
+        assert "NOT the ETH Zurich Urban MAV dataset" in label
+        assert "scripts/generate_sample_zurich.py" in label
+
+    def test_corrupt_marker_still_flags_local_data(self, fake_zurich_dataset: Path) -> None:
+        """An unreadable marker must fail safe (flag as local data), not silently pass."""
+        (fake_zurich_dataset / "dataset_provenance.json").write_text("{not json", encoding="utf-8")
+        source = ZurichSequenceSource(dataset_dir=fake_zurich_dataset, count=2)
+        assert source.provenance is not None
+        assert "synthetic sample dataset" in source.dataset_label("replayed public dataset")
+
+
+class TestCalibrationResolution:
+    """Verify calibration follows the pixels on disk instead of a hardcoded 1920x1080."""
+
+    def test_calibration_uses_native_image_resolution(self, mini_recon_dataset: Path) -> None:
+        """A 640x480 dataset must report 640x480 intrinsics geometry."""
+        source = ZurichSequenceSource(dataset_dir=mini_recon_dataset, count=2)
+        calib = source.calibration()
+
+        assert (calib.width, calib.height) == (640, 480)
+        assert calib.params[2] == 320.0
+        assert calib.params[3] == 240.0

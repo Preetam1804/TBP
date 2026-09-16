@@ -6,6 +6,93 @@ import cv2
 import numpy as np
 import pytest
 
+# Camera used by the reconstruction-capable mini scene fixture.
+MINI_W, MINI_H = 640, 480
+MINI_FX = MINI_FY = 500.0
+MINI_CX, MINI_CY = MINI_W / 2.0, MINI_H / 2.0
+
+
+def _render_mini_scene_frames(num_frames: int, seed: int = 7) -> list[np.ndarray]:
+    """Render frames of a static 3D point cloud observed by a translating camera.
+
+    Unlike a moving 2D pattern, this gives real parallax so incremental SfM can
+    actually triangulate the scene, which is what makes an end-to-end test of the
+    sfm/sync/validate stages possible without shipping image data in the repo.
+    """
+    rng = np.random.default_rng(seed)
+    num_landmarks = 420
+    # Landmarks distributed on the far side of the OpenCV camera axis (+Z) along
+    # a corridor that the camera flies through from x=0 to x≈5.
+    xs = rng.uniform(-3.0, 8.0, num_landmarks)
+    ys = rng.uniform(-3.2, 3.2, num_landmarks)
+    zs = rng.uniform(4.5, 8.5, num_landmarks)
+    radii = [int(r) for r in rng.integers(3, 7, num_landmarks)]
+    palette = rng.integers(60, 240, (num_landmarks, 3)).tolist()
+
+    frames: list[np.ndarray] = []
+    for i in range(num_frames):
+        img = np.full((MINI_H, MINI_W, 3), 30, dtype=np.uint8)
+        cam_center = np.array([0.6 * i, 0.0, 0.0], dtype=np.float64)
+        rvec = np.zeros(3, dtype=np.float64)
+        tvec = -cam_center
+
+        pts = np.column_stack([xs, ys, zs])
+        projected, _ = cv2.projectPoints(pts, rvec, tvec, np.array([[MINI_FX, 0, MINI_CX], [0, MINI_FY, MINI_CY], [0, 0, 1.0]]), None)
+        uv = projected.reshape(-1, 2)
+
+        for j in range(num_landmarks):
+            u, v = round(uv[j, 0]), round(uv[j, 1])
+            if 8 <= u < MINI_W - 8 and 8 <= v < MINI_H - 8:
+                bgr = (palette[j][0], palette[j][1], palette[j][2])
+                cv2.circle(img, (u, v), radii[j], bgr, -1, cv2.LINE_AA)
+                cv2.circle(img, (u, v), max(1, radii[j] // 2), (255 - bgr[0], 255 - bgr[1], 255 - bgr[2]), -1)
+        frames.append(img)
+    return frames
+
+
+@pytest.fixture
+def mini_recon_dataset(tmp_path: Path) -> Path:
+    """Build a small Zurich-layout dataset that is genuinely reconstructable.
+
+    Contains 10 frames of a static 3D scene, matching calibration, onboard GPS
+    rows for every frame and evaluation ground truth for every frame, so the
+    complete inspect -> keyframes -> sfm -> sync -> validate chain can be
+    exercised end to end inside a temporary directory.
+    """
+    dataset_dir = tmp_path / "mini_zurich"
+    images_dir = dataset_dir / "MAV Images"
+    logs_dir = dataset_dir / "Log Files"
+    images_dir.mkdir(parents=True)
+    logs_dir.mkdir(parents=True)
+
+    num_frames = 10
+    frames = _render_mini_scene_frames(num_frames)
+    for i, frame in enumerate(frames):
+        cv2.imwrite(str(images_dir / f"frame_{i:05d}.jpg"), frame)
+
+    k_matrix = np.array([[MINI_FX, 0.0, MINI_CX], [0.0, MINI_FY, MINI_CY], [0.0, 0.0, 1.0]], dtype=np.float64)
+    np.savez(
+        str(dataset_dir / "calibration_data.npz"),
+        camera_matrix=k_matrix,
+        distortion_coefficients=np.zeros(4, dtype=np.float64),
+    )
+
+    base_ts = 1459425600000000
+    with open(logs_dir / "OnbordGPS.csv", "w", encoding="utf-8") as f:
+        f.write("# timestamp, image_id, lat, lon, alt\n")
+        for i in range(num_frames):
+            f.write(
+                f"{base_ts + i * 200000}, {i}, {47.3769 + i * 0.000015:.6f}, "
+                f"{8.5417 + i * 0.000018:.6f}, {450.0 + i * 0.1:.2f}\n"
+            )
+
+    with open(logs_dir / "GroundTruthAGL.csv", "w", encoding="utf-8") as f:
+        f.write("# image_id, x, y, z\n")
+        for i in range(num_frames):
+            f.write(f"{i}, {0.6 * i:.4f}, 0.0, 0.0\n")
+
+    return dataset_dir
+
 
 @pytest.fixture
 def fake_zurich_dataset(tmp_path: Path) -> Path:

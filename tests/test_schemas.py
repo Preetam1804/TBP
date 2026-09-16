@@ -1,6 +1,10 @@
 """Tests for uav3d schemas, config loading, and CLI commands."""
 
+import json
+from pathlib import Path
+
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from uav3d.cli import main
@@ -173,9 +177,120 @@ class TestCliSmoke:
     def test_subcommand_help_exits_zero(self, subcommand: str) -> None:
         assert main([subcommand, "--help"]) == 0
 
-    @pytest.mark.parametrize("subcommand", ["inspect", "keyframes", "sfm", "sync", "validate"])
-    def test_subcommand_stub_execution(self, subcommand: str) -> None:
-        cmd = [subcommand, "--config", "configs/zurich_baseline.yaml"]
-        if subcommand in {"sync", "validate"}:
-            cmd.extend(["--run-dir", "data/outputs/run_20260914_112220"])
-        assert main(cmd) == 0
+    def test_missing_dataset_fails_loudly(self, tmp_path: Path) -> None:
+        """A missing dataset must produce a clear non-zero failure, not a silent pass."""
+        config_path = tmp_path / "cfg.yaml"
+        config_path.write_text(
+            yaml.dump(
+                {
+                    "data_dir": str(tmp_path),
+                    "source": {"type": "zurich", "dataset_dir": str(tmp_path / "absent")},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert main(["inspect", "--config", str(config_path)]) == 1
+
+
+class TestEndToEndPipeline:
+    """Run all five stages on a self-contained, reconstructable mini dataset.
+
+    This replaces the previous smoke test that depended on a run directory from
+    the author's machine (`data/outputs/run_20260914_112220`), which made the
+    sync and validate coverage permanently fail on any other checkout.
+    """
+
+    @pytest.fixture
+    def run_dir(self, mini_recon_dataset: Path, tmp_path: Path) -> Path:
+        """Execute inspect -> keyframes -> sfm -> sync -> validate and return the run directory."""
+        config_path = tmp_path / "mini_cfg.yaml"
+        config_path.write_text(
+            yaml.dump(
+                {
+                    "data_dir": str(tmp_path),
+                    "dataset_label": "unit-test mini dataset",
+                    "source": {
+                        "type": "zurich",
+                        "dataset_dir": str(mini_recon_dataset),
+                        "start_id": 0,
+                        "count": 10,
+                        "stride": 1,
+                    },
+                    "keyframes": {"stride": 1, "min_blur": 10.0, "max_clipping": 0.5, "max_gap": 15},
+                    "sfm": {"seq_overlap": 5, "max_image_size": 640},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert main(["inspect", "--config", str(config_path)]) == 0
+        assert main(["keyframes", "--config", str(config_path)]) == 0
+
+        outputs_dir = tmp_path / "outputs"
+        run_dirs = sorted(d for d in outputs_dir.iterdir() if d.is_dir())
+        assert run_dirs, "keyframes stage produced no run directory"
+        run_dir = run_dirs[-1]
+
+        assert main(["sfm", "--config", str(config_path), "--run-dir", str(run_dir)]) == 0
+        assert main(["sync", "--config", str(config_path), "--run-dir", str(run_dir)]) == 0
+        assert main(["validate", "--config", str(config_path), "--run-dir", str(run_dir)]) == 0
+        return run_dir
+
+    def test_all_artifacts_are_written(self, run_dir: Path) -> None:
+        """Every documented stage artifact exists and is non-empty."""
+        for name in (
+            "keyframes.json",
+            "poses.json",
+            "telemetry.json",
+            "poses_enriched.json",
+            "ate_report.json",
+            "SP1_REPORT.md",
+            "trajectory_3d.png",
+            "ate_error_profile.png",
+        ):
+            artifact = run_dir / name
+            assert artifact.is_file(), f"missing artifact {name}"
+            assert artifact.stat().st_size > 0
+
+    def test_poses_schema_and_registration(self, run_dir: Path) -> None:
+        """poses.json validates against the schema and registers the mini scene."""
+        poses_file = PosesFile.model_validate_json((run_dir / "poses.json").read_text(encoding="utf-8"))
+        assert poses_file.metrics is not None
+        assert poses_file.metrics.num_images_registered >= 8
+        assert poses_file.metrics.registration_rate >= 0.8
+        assert poses_file.metrics.mean_reprojection_error_px <= 1.5
+        assert poses_file.camera is not None
+        # Locked intrinsics must be reported as locked, with the real calibration.
+        assert poses_file.camera.intrinsics_locked is True
+        assert poses_file.camera.model == "OPENCV"
+        assert poses_file.camera.intrinsics_source == "calibration_data.npz"
+        assert poses_file.camera.horizontal_fov_deg is not None
+
+    def test_telemetry_matches_every_frame(self, run_dir: Path) -> None:
+        """Mode A joins the dataset image IDs exactly and never reports a false mapping."""
+        telemetry = TelemetryFile.model_validate_json((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+        assert telemetry.sync_status == "dataset_image_id_mapping"
+        assert telemetry.summary["matched_telemetry_frames"] == telemetry.summary["total_frames"]
+        assert all(r.lat is not None for r in telemetry.records)
+
+    def test_validation_report_records_ground_truth_provenance(self, run_dir: Path) -> None:
+        """ate_report.json must state which ground truth produced the numbers."""
+        report = json.loads((run_dir / "ate_report.json").read_text(encoding="utf-8"))
+        provenance = report["ground_truth"]
+        assert provenance["selection"] == "auto_discovered_from_source"
+        assert provenance["file"].endswith("GroundTruthAGL.csv")
+        assert provenance["ate_threshold_m"] == 5.0
+        assert report["status"] == "completed"
+        assert report["metrics"]["num_matched_frames"] >= 8
+
+    def test_validate_refuses_run_without_ground_truth_definition(self, run_dir: Path) -> None:
+        """A video-namespace run must not be graded against unrelated ground truth."""
+        poses_path = run_dir / "poses.json"
+        payload = json.loads(poses_path.read_text(encoding="utf-8"))
+        for pose in payload["poses"]:
+            pose["frame_id"] = pose["frame_id"].replace("zurich_", "video_")
+        payload["unregistered_frames"] = []
+        poses_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        # Without --gt-file the CLI must refuse rather than silently reuse the dataset GT.
+        assert main(["validate", "--run-dir", str(run_dir)]) == 1
