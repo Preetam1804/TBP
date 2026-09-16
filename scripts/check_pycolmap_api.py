@@ -1,6 +1,16 @@
-"""Scratch script to inspect installed pycolmap API signatures and attributes."""
+"""Print the pycolmap API surface of the installed version.
 
-import inspect
+The pipeline pins pycolmap==3.12.*, but the bindings differ between releases
+(``Image.cam_from_world()`` vs ``qvec/tvec``, option attribute names, etc.).
+Run this utility after changing the pin to see what the installed build offers:
+
+    uv run python scripts/check_pycolmap_api.py
+
+It only prints information; it never modifies project data.
+"""
+
+import contextlib
+
 import pycolmap
 
 print("=== pycolmap version ===")
@@ -11,10 +21,8 @@ for fn_name in ["extract_features", "match_sequential", "incremental_mapping"]:
     if hasattr(pycolmap, fn_name):
         fn = getattr(pycolmap, fn_name)
         print(f"{fn_name}: {fn}")
-        try:
+        with contextlib.suppress(AttributeError):
             print(f"  doc: {fn.__doc__}")
-        except Exception:
-            pass
     else:
         print(f"{fn_name}: NOT FOUND")
 

@@ -1,5 +1,6 @@
-"""Generate synthetic MP4 video and ground-truth frame manifest for video pipeline tests."""
+"""Assemble an MP4 clip (plus ground-truth frame manifest) for video pipeline testing."""
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -59,11 +60,23 @@ def generate_synthetic_frame(index: int, width: int = 1920, height: int = 1080) 
 def make_synthetic_video(
     output_video_path: Path | str = "data/interim/synthetic.mp4",
     output_manifest_path: Path | str = "data/interim/manifest.json",
-    num_frames: int = 100,
+    num_frames: int = 50,
     fps: float = 5.0,
     zurich_dir: Path | str | None = "data/raw/zurich_mav",
+    pad_synthetic: bool = False,
 ) -> None:
-    """Create a 100-frame MP4 at 5 fps plus manifest.json mapping frames."""
+    """Create an MP4 plus manifest.json mapping frames to source images.
+
+    By default the clip is built only from frames that exist on disk under
+    ``zurich_dir``. Those frames overlap visually, so the video path can be
+    validated for camera registration the same way the image-sequence path is.
+
+    Previously this always emitted 100 frames and padded the tail with
+    procedurally generated images that share no scene content with the rest of
+    the clip. Half of all frames were then unregistrable by construction, which
+    made any registration rate measured on the clip meaningless. Pass
+    ``pad_synthetic=True`` to opt into that behaviour for stress testing.
+    """
     video_out = Path(output_video_path).resolve()
     manifest_out = Path(output_manifest_path).resolve()
 
@@ -77,6 +90,13 @@ def make_synthetic_video(
         if z_path.exists():
             for ext in ("*.jpg", "*.jpeg", "*.png"):
                 zurich_images.extend(sorted(z_path.rglob(ext)))
+
+    if not pad_synthetic and len(zurich_images) < num_frames:
+        logger.info(
+            f"Using all {len(zurich_images)} available source images (requested {num_frames}); "
+            "not padding with unrelated synthetic frames."
+        )
+        num_frames = len(zurich_images)
 
     width = 1920
     height = 1080
@@ -129,5 +149,33 @@ def make_synthetic_video(
     logger.info(f"Wrote {len(manifest)} manifest entries to {manifest_out}")
 
 
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the synthetic clip generator."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--output", default="data/interim/synthetic.mp4", help="Destination MP4 path")
+    parser.add_argument("--manifest", default="data/interim/manifest.json", help="Destination manifest path")
+    parser.add_argument("--frames", type=int, default=50, help="Maximum number of frames (default: 50)")
+    parser.add_argument("--fps", type=float, default=5.0, help="Playback rate for the output clip")
+    parser.add_argument(
+        "--zurich-dir",
+        default="data/raw/zurich_mav",
+        help="Directory of source frames to assemble into a clip",
+    )
+    parser.add_argument(
+        "--pad-synthetic",
+        action="store_true",
+        help="Pad the clip with procedurally generated frames (they do not overlap the real frames)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    make_synthetic_video()
+    args = _parse_args()
+    make_synthetic_video(
+        output_video_path=args.output,
+        output_manifest_path=args.manifest,
+        num_frames=args.frames,
+        fps=args.fps,
+        zurich_dir=args.zurich_dir,
+        pad_synthetic=args.pad_synthetic,
+    )

@@ -1,6 +1,19 @@
-"""Generate realistic 3D synthetic aerial sample dataset for Zurich Urban MAV."""
+"""Generate a synthetic stand-in dataset that mimics the Zurich Urban MAV layout.
 
+Writes to ``data/raw/zurich_mav`` by default, which is the same path the real
+ETH Zurich dataset would occupy. To prevent sample numbers being mistaken for
+real-dataset results, this generator:
+
+  * refuses to run over a directory that already contains data unless ``--force``
+    is passed, and
+  * writes ``dataset_provenance.json``, which the pipeline reads to label every
+    downstream output as synthetic sample data.
+"""
+
+import argparse
+import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import cv2
@@ -13,18 +26,56 @@ logger = logging.getLogger("generate_sample_zurich")
 def generate_zurich_sample_dataset(
     dataset_dir: str | Path = "data/raw/zurich_mav",
     num_frames: int = 50,
+    force: bool = False,
 ) -> None:
-    """Populate data/raw/zurich_mav with 50 frames observing a true 3D scene.
+    """Populate the dataset directory with frames observing a true 3D scene.
 
     Ensures that visual SfM (pycolmap) can extract consistent SIFT features,
     triangulate 3D points, lock known intrinsics, and estimate camera poses
     matching the GroundTruthAGL and GPS trajectory.
+
+    Args:
+        dataset_dir: Destination directory (mimics the Zurich dataset layout).
+        num_frames: Number of frames to render.
+        force: Allow overwriting a non-empty directory.
+
+    Raises:
+        SystemExit: If the target directory is non-empty and ``force`` is False.
     """
     base = Path(dataset_dir).resolve()
     img_dir = base / "MAV Images"
     log_dir = base / "Log Files"
+
+    existing_marker = base / "dataset_provenance.json"
+    if base.exists() and not existing_marker.is_file() and not force:
+        existing = [p for p in base.rglob("*") if p.is_file()]
+        if existing:
+            raise SystemExit(
+                f"Refusing to write synthetic sample data into non-empty directory {base} "
+                f"({len(existing)} existing files). This path is where the real ETH Zurich "
+                "Urban MAV dataset belongs. Pass --force to overwrite, or choose another "
+                "--dataset-dir."
+            )
+    if existing_marker.is_file() and not force:
+        logger.info(f"Existing synthetic sample dataset detected at {base}; regenerating in place.")
+
     img_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Provenance marker: consumed by ZurichSequenceSource.dataset_label()
+    marker_payload = {
+        "kind": "synthetic_sample",
+        "generator": "scripts/generate_sample_zurich.py",
+        "generated_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        "num_frames": int(num_frames),
+        "note": (
+            "Locally generated stand-in data for pipeline development. Not the ETH Zurich "
+            "Urban MAV dataset; results from this directory must never be reported as "
+            "real-dataset measurements."
+        ),
+    }
+    existing_marker.write_text(json.dumps(marker_payload, indent=2) + "\n", encoding="utf-8")
+    logger.info(f"Wrote provenance marker {existing_marker}")
 
     # Camera calibration (GoPro Hero4 1080p from Zurich dataset)
     W, H = 1920, 1080
@@ -82,7 +133,7 @@ def generate_zurich_sample_dataset(
             img[y, :, 2] = int(45 + 20 * (y / H))
 
         # Project 3D landmarks
-        for pt, pat in zip(pts3D, patterns):
+        for pt, pat in zip(pts3D, patterns, strict=True):
             p_c = R_cw @ pt + t_cw
             if p_c[2] > 2.0:
                 u = int(fx * p_c[0] / p_c[2] + cx)
@@ -136,5 +187,23 @@ def generate_zurich_sample_dataset(
     logger.info(f"Generated {gt_path}")
 
 
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the sample dataset generator."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--dataset-dir",
+        default="data/raw/zurich_mav",
+        help="Destination directory mimicking the Zurich MAV layout (default: data/raw/zurich_mav)",
+    )
+    parser.add_argument("--frames", type=int, default=50, help="Number of frames to render (default: 50)")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite a non-empty directory (never use this on the real ETH Zurich dataset)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    generate_zurich_sample_dataset()
+    args = _parse_args()
+    generate_zurich_sample_dataset(dataset_dir=args.dataset_dir, num_frames=args.frames, force=args.force)
