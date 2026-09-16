@@ -39,6 +39,22 @@ sfm:
   init_min_tri_angle: 2.0
   abs_pose_min_inliers: 10
 
+  # --- Video source intrinsics -------------------------------------------------
+  # Video files carry no trustworthy intrinsics. A focal length is either supplied
+  # explicitly (video_focal_px, or `uav3d sfm --focal-px`), which locks intrinsics,
+  # or assumed from video_fov_deg and then refined.
+  #
+  # A refined camera is kept only if it stays physically plausible (implied FoV
+  # inside the window below, near-isotropic focal lengths, principal point near
+  # image center). If it fails, the run is redone with the supplied intrinsics
+  # locked and the rejection is reported, rather than exporting an impossible
+  # camera with a good-looking reprojection error.
+  video_fov_deg: 60.0          # assumed horizontal FoV when no focal length is known
+  video_focal_px: null         # explicit focal length in pixels; set to lock intrinsics
+  video_min_fov_deg: 35.0      # lower credible horizontal FoV bound for refined cameras
+  video_max_fov_deg: 100.0     # upper credible horizontal FoV bound for refined cameras
+  allow_unbounded_intrinsics: false  # true = keep implausible refined intrinsics with a warning
+
 sync:
   max_delta_us: 50000
   strategy: "nearest"
