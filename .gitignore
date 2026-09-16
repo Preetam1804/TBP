@@ -28,8 +28,18 @@ dist/
 logs/
 *.log
 
-# Data
-data/
+# Data: keep the directory skeleton, ignore every payload.
+# `data/*` (not `data/`) is what makes the negations below effective: git does
+# not descend into an excluded directory, so the parent must stay traversable.
+data/*
 !data/.gitkeep
+!data/raw
+!data/interim
+
+data/raw/*
 !data/raw/.gitkeep
+
+data/interim/*
 !data/interim/.gitkeep
+
+data/outputs/
