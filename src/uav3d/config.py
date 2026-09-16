@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from uav3d.exceptions import ConfigError
 
@@ -54,6 +54,43 @@ class SfmConfig(BaseModel):
     abs_pose_min_inliers: int = Field(default=10, ge=1, description="Minimum inliers for absolute pose registration")
     min_model_size: int = Field(default=3, ge=2, description="Minimum registered images to keep reconstruction")
     ignore_watermarks: bool = Field(default=True, description="Whether to ignore watermark detection in sequential matching")
+    video_fov_deg: float = Field(
+        default=60.0,
+        gt=0.0,
+        lt=180.0,
+        description="Assumed horizontal field of view (deg) for uncalibrated video sources",
+    )
+    video_focal_px: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Explicit focal length in pixels for video sources; disables focal refinement when set",
+    )
+    video_min_fov_deg: float = Field(
+        default=35.0,
+        gt=0.0,
+        lt=180.0,
+        description="Lower credible horizontal FoV bound for post-BA video intrinsics validation",
+    )
+    video_max_fov_deg: float = Field(
+        default=100.0,
+        gt=0.0,
+        lt=180.0,
+        description="Upper credible horizontal FoV bound for post-BA video intrinsics validation",
+    )
+    allow_unbounded_intrinsics: bool = Field(
+        default=False,
+        description="If true, log (instead of abort) when refined intrinsics fail the plausibility gate",
+    )
+
+    @model_validator(mode="after")
+    def _validate_fov_window(self) -> "SfmConfig":
+        """Require a coherent FoV plausibility window."""
+        if self.video_min_fov_deg >= self.video_max_fov_deg:
+            raise ValueError(
+                f"video_min_fov_deg ({self.video_min_fov_deg}) must be strictly less than "
+                f"video_max_fov_deg ({self.video_max_fov_deg})"
+            )
+        return self
 
 
 class SyncConfig(BaseModel):
@@ -117,7 +154,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         if not path_obj.exists():
             raise ConfigError(f"Configuration file not found: {path_obj}")
         try:
-            with open(path_obj, "r", encoding="utf-8") as f:
+            with open(path_obj, encoding="utf-8") as f:
                 loaded = yaml.safe_load(f)
                 if loaded is not None:
                     if not isinstance(loaded, dict):

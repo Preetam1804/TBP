@@ -1,9 +1,11 @@
 """Zurich Urban MAV dataset adapter implementing ImageSource protocol."""
 
+import json
 import logging
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -22,6 +24,9 @@ logger = logging.getLogger("uav3d.sources.zurich")
 # Zurich Urban MAV camera default dimensions (GoPro Hero4 Black)
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
+
+#: Marker file written by scripts/generate_sample_zurich.py into sample datasets.
+PROVENANCE_MARKER_FILENAME = "dataset_provenance.json"
 
 
 class ZurichSequenceSource(ImageSource):
@@ -47,6 +52,16 @@ class ZurichSequenceSource(ImageSource):
         # 1. Validate paths and discover directory layout
         self.images_dir, self.gps_file, self.gt_file, self.calib_file = self._resolve_dataset_paths()
 
+        # 1b. Detect locally generated sample data so outputs are never labelled
+        # as if they came from the real ETH Zurich Urban MAV dataset.
+        self.provenance: dict[str, Any] | None = self._read_provenance_marker()
+        if self.provenance is not None:
+            logger.warning(
+                f"Dataset at {self.dataset_dir} is a LOCALLY GENERATED SAMPLE "
+                f"(marker: {PROVENANCE_MARKER_FILENAME}). Pipeline outputs will be labelled "
+                "'synthetic sample dataset' and must not be reported as ETH Zurich Urban MAV results."
+            )
+
         # 2. Parse telemetry and ground truth defensively
         self._gps_records: dict[int, ZurichGpsRecord] = {}
         if self.gps_file and self.gps_file.exists():
@@ -64,6 +79,39 @@ class ZurichSequenceSource(ImageSource):
 
         # Cache frame records
         self._frame_cache: dict[str, FrameRecord] = {}
+        self._native_size: tuple[int, int] | None = None
+
+    def _read_provenance_marker(self) -> dict[str, Any] | None:
+        """Read a ``dataset_provenance.json`` marker if the directory is synthetic.
+
+        The sample-data generator writes this marker into ``data/raw/zurich_mav``.
+        Its presence means the directory holds locally generated stand-in data
+        rather than the real ETH Zurich Urban MAV dataset, which must be
+        reflected in every downstream ``dataset_label``.
+        """
+        marker = self.dataset_dir / PROVENANCE_MARKER_FILENAME
+        if not marker.is_file():
+            return None
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(f"Unreadable provenance marker {marker}: {exc}")
+            return {"kind": "unknown_local_data", "marker": str(marker)}
+        if not isinstance(payload, dict):
+            return {"kind": "unknown_local_data", "marker": str(marker)}
+        return payload
+
+    def dataset_label(self, default_label: str) -> str:
+        """Return the provenance label appropriate for this dataset directory."""
+        if self.provenance is None:
+            return default_label
+        kind = str(self.provenance.get("kind", "local_sample"))
+        generator = self.provenance.get("generator")
+        detail = f", generator={generator}" if generator else ""
+        return (
+            f"synthetic sample dataset ({kind}{detail}) - locally generated stand-in data, "
+            "NOT the ETH Zurich Urban MAV dataset"
+        )
 
     def _resolve_dataset_paths(self) -> tuple[Path, Path | None, Path | None, Path | None]:
         """Validate dataset structure against directory traversal and find component files."""
@@ -233,7 +281,13 @@ class ZurichSequenceSource(ImageSource):
         )
 
     def calibration(self) -> CameraCalibration:
-        """Load intrinsic camera calibration from calibration_data.npz or provide default GoPro Hero4."""
+        """Load intrinsic camera calibration from calibration_data.npz or provide default GoPro Hero4.
+
+        The declared resolution is the native resolution of the images on disk
+        (probed from the first frame), never a hardcoded 1920x1080, so that the
+        principal point and any downstream rescaling stay consistent.
+        """
+        width, height = self._native_resolution()
         if self.calib_file and self.calib_file.exists():
             try:
                 npz = np.load(self.calib_file)
@@ -250,8 +304,8 @@ class ZurichSequenceSource(ImageSource):
                         model = "OPENCV"
                     return CameraCalibration(
                         model=model,
-                        width=DEFAULT_WIDTH,
-                        height=DEFAULT_HEIGHT,
+                        width=width,
+                        height=height,
                         params=params,
                         source=str(self.calib_file.name),
                     )
@@ -260,13 +314,37 @@ class ZurichSequenceSource(ImageSource):
 
         # Default calibrated intrinsics for GoPro Hero4 1080p from Zurich MAV dataset
         # K = [fx: 1060.0, fy: 1060.0, cx: 960.0, cy: 540.0]
+        logger.warning("No calibration_data.npz found; falling back to published Zurich GoPro Hero4 intrinsics.")
         return CameraCalibration(
             model="PINHOLE",
-            width=DEFAULT_WIDTH,
-            height=DEFAULT_HEIGHT,
-            params=[1060.0, 1060.0, 960.0, 540.0],
+            width=width,
+            height=height,
+            params=[1060.0, 1060.0, width / 2.0, height / 2.0],
             source="zurich_default_intrinsics",
         )
+
+    def _native_resolution(self) -> tuple[int, int]:
+        """Return the pixel resolution of the images on disk (cached, probed once)."""
+        if self._native_size is None:
+            first_id = self._all_image_ids[0]
+            path = self._image_paths[first_id]
+            shape: tuple[int, int] | None = None
+            try:
+                import cv2
+
+                probe = cv2.imread(str(path), cv2.IMREAD_REDUCED_COLOR_8)
+                if probe is not None:
+                    # IMREAD_REDUCED_COLOR_8 downsamples by 8 in each axis
+                    shape = (int(probe.shape[1]) * 8, int(probe.shape[0]) * 8)
+            except (OSError, ValueError) as exc:  # pragma: no cover - defensive
+                logger.warning(f"Could not probe image resolution of {path}: {exc}")
+            self._native_size = shape or (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+            if self._native_size != (DEFAULT_WIDTH, DEFAULT_HEIGHT):
+                logger.info(
+                    f"Detected native dataset resolution {self._native_size[0]}x{self._native_size[1]} "
+                    f"from {path.name} (default would be {DEFAULT_WIDTH}x{DEFAULT_HEIGHT})."
+                )
+        return self._native_size
 
     def iter_frames(self) -> Iterator[FrameRecord]:
         """Lazily iterate over FrameRecords without loading images into memory."""

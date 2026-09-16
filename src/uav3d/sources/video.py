@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 
+from uav3d.calibration import estimate_video_calibration
 from uav3d.exceptions import DataError, Uav3dError
 from uav3d.models.frames import CameraCalibration, FrameRecord
 from uav3d.sources.base import ImageSource, SourceMetadata
@@ -56,17 +57,16 @@ class VideoFileSource(ImageSource):
         )
 
     def calibration(self) -> CameraCalibration:
-        """Return generic or estimated camera calibration for video stream."""
-        # Generic pinhole camera model based on frame dimensions (FOV ~60 deg)
-        fx = fy = float(self._width) * 0.8
-        cx = float(self._width) / 2.0
-        cy = float(self._height) / 2.0
-        return CameraCalibration(
-            model="PINHOLE",
+        """Return the assumed calibration for this video stream.
+
+        Delegates to :func:`uav3d.calibration.estimate_video_calibration` so that
+        ``uav3d inspect`` and ``uav3d sfm`` always report the same intrinsics for
+        the same file.
+        """
+        return estimate_video_calibration(
             width=self._width,
             height=self._height,
-            params=[fx, fy, cx, cy],
-            source=f"video_estimate_{self.video_path.name}",
+            source_note="inspect_default_fov",
         )
 
     def iter_frames(self) -> Iterator[FrameRecord]:
@@ -84,11 +84,9 @@ class VideoFileSource(ImageSource):
                 if not ret:
                     break
 
-                # Convert to integer microseconds
-                if pos_msec > 0:
-                    pts_us = int(pos_msec * 1000)
-                else:
-                    pts_us = int((frame_idx / self._fps) * 1_000_000)
+                # Convert to integer microseconds (fall back to index/FPS when the
+                # container does not report a presentation timestamp).
+                pts_us = int(pos_msec * 1000) if pos_msec > 0 else int((frame_idx / self._fps) * 1_000_000)
 
                 frame_id = f"video_{frame_idx:06d}"
                 record = FrameRecord(

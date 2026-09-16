@@ -1,6 +1,5 @@
 """Export COLMAP reconstruction to validated PosesFile schema."""
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -110,6 +109,9 @@ def export_poses(
     dataset_label: str = "replayed public dataset",
     scale_factor: float = 1.0,
     timestamps_map: dict[str, int | None] | None = None,
+    intrinsics_locked: bool = True,
+    initial_params: list[float] | None = None,
+    horizontal_fov_deg: float | None = None,
 ) -> PosesFile:
     """Export COLMAP reconstruction poses to validated PosesFile schema.
 
@@ -121,6 +123,9 @@ def export_poses(
         dataset_label: Dataset provenance label.
         scale_factor: Resolution scale factor used during feature extraction.
         timestamps_map: Optional mapping of frame_id -> timestamp_us.
+        intrinsics_locked: Whether bundle adjustment was forbidden from refining intrinsics.
+        initial_params: Pre-BA intrinsics (recorded when refinement was enabled).
+        horizontal_fov_deg: Horizontal FoV implied by the final intrinsics.
 
     Returns:
         Validated PosesFile instance.
@@ -258,6 +263,10 @@ def export_poses(
         height=h,
         params=verified_params,
         scale_factor=scale_factor,
+        intrinsics_locked=intrinsics_locked,
+        initial_params=initial_params,
+        horizontal_fov_deg=horizontal_fov_deg,
+        intrinsics_source=camera_calibration.source,
     )
 
     # 5. Build and validate PosesFile schema

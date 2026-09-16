@@ -9,6 +9,11 @@ from typing import Any
 import numpy as np
 import pycolmap
 
+from uav3d.calibration import (
+    camera_params_expected_count,
+    check_intrinsics_sanity,
+    horizontal_fov_deg,
+)
 from uav3d.config import SfmConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.models.frames import CameraCalibration
@@ -41,6 +46,12 @@ class SfmRunResult:
     profiles: list[SfmStageProfile]
     total_wall_time_s: float
     peak_rss_mb: float
+    intrinsics_refined: bool
+    initial_params: list[float]
+    final_params: list[float]
+    final_fov_deg: float | None
+    intrinsics_violations: list[str]
+    refinement_rejected: bool
 
 
 class SfmRunner:
@@ -48,6 +59,66 @@ class SfmRunner:
 
     def __init__(self, config: SfmConfig | None = None) -> None:
         self.config = config or SfmConfig()
+
+    @staticmethod
+    def _first_camera(reconstruction: pycolmap.Reconstruction) -> Any:
+        """Return the first camera of a reconstruction."""
+        return next(iter(reconstruction.cameras.values()))
+
+    @staticmethod
+    def _camera_model_name(reconstruction: pycolmap.Reconstruction, fallback: str) -> str:
+        """Return the COLMAP model name of the reconstruction's first camera."""
+        camera = next(iter(reconstruction.cameras.values()), None)
+        if camera is None:
+            return fallback
+        return str(getattr(camera, "model", fallback)).replace("CameraModelId.", "")
+
+    def _run_mapping(
+        self,
+        database_path: Path,
+        image_path: Path,
+        output_dir: Path,
+        refine: bool,
+    ) -> dict[int, Any]:
+        """Run COLMAP incremental mapping with intrinsics either refined or locked.
+
+        Args:
+            database_path: COLMAP database containing extracted features and matches.
+            image_path: Directory holding the images referenced by the database.
+            output_dir: Directory to write the sparse reconstruction into.
+            refine: When False, bundle adjustment and absolute pose refinement are
+                forbidden from touching the intrinsics.
+
+        Returns:
+            Mapping of model index to pycolmap.Reconstruction.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        pipeline_opts = pycolmap.IncrementalPipelineOptions()
+        if not refine:
+            pipeline_opts.ba_refine_focal_length = False
+            pipeline_opts.ba_refine_principal_point = False
+            pipeline_opts.ba_refine_extra_params = False
+            pipeline_opts.mapper.abs_pose_refine_focal_length = False
+            pipeline_opts.mapper.abs_pose_refine_extra_params = False
+
+        pipeline_opts.mapper.init_min_tri_angle = self.config.init_min_tri_angle
+        pipeline_opts.mapper.init_min_num_inliers = self.config.init_min_inliers
+        pipeline_opts.mapper.abs_pose_min_num_inliers = self.config.abs_pose_min_inliers
+        pipeline_opts.min_model_size = self.config.min_model_size
+        pipeline_opts.ignore_watermarks = self.config.ignore_watermarks
+
+        logger.info(f"Incremental mapping (refine_intrinsics={refine}) -> {output_dir}")
+        try:
+            reconstructions = pycolmap.incremental_mapping(
+                database_path=str(database_path),
+                image_path=str(image_path),
+                output_path=str(output_dir),
+                options=pipeline_opts,
+            )
+        except Exception as exc:
+            raise Uav3dError(f"Incremental mapping failed with exception: {exc}") from exc
+        return reconstructions or {}
 
     def run(
         self,
@@ -88,7 +159,7 @@ class SfmRunner:
 
         # Discover image files (deduplicated to prevent duplicate entries on Windows)
         image_files = sorted(
-            list({p.name for p in img_path.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}})
+            {p.name for p in img_path.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}}
         )
         total_images = len(image_files)
         if total_images == 0:
@@ -102,13 +173,33 @@ class SfmRunner:
         # Stage 1: Feature Extraction
         # -------------------------------------------------------------
         t0 = time.perf_counter()
-        logger.info(f"Stage 1/4: Feature extraction (model={self.config.camera_model}, max_size={self.config.max_image_size})")
+
+        # The calibration owns the parameter vector, so its model is authoritative.
+        # Using a different model from the config with those parameters produced
+        # COLMAP's opaque "Invalid camera parameters" failure.
+        camera_model = calibration.model.upper()
+        if camera_model != self.config.camera_model.upper():
+            logger.warning(
+                f"Config camera_model='{self.config.camera_model}' does not match the calibration model "
+                f"'{calibration.model}'; using the calibration model for extraction so the parameter "
+                "vector stays valid."
+            )
+
+        expected_num_params = camera_params_expected_count(camera_model)
+        if expected_num_params is not None and len(calibration.params) != expected_num_params:
+            raise Uav3dError(
+                f"Calibration for model {camera_model} provides {len(calibration.params)} parameters "
+                f"but {expected_num_params} are required: {calibration.params}. "
+                "Fix the calibration source before running SfM."
+            )
+
+        logger.info(f"Stage 1/4: Feature extraction (model={camera_model}, max_size={self.config.max_image_size})")
 
         sift_opts = pycolmap.SiftExtractionOptions()
         sift_opts.max_image_size = self.config.max_image_size
 
         reader_opts = pycolmap.ImageReaderOptions()
-        reader_opts.camera_model = self.config.camera_model
+        reader_opts.camera_model = camera_model
         reader_opts.camera_params = ",".join(str(p) for p in calibration.params)
 
         camera_mode = pycolmap.CameraMode.SINGLE if self.config.single_camera else pycolmap.CameraMode.AUTO
@@ -119,7 +210,7 @@ class SfmRunner:
                 image_path=str(img_path),
                 image_names=image_files,
                 camera_mode=camera_mode,
-                camera_model=self.config.camera_model,
+                camera_model=camera_model,
                 reader_options=reader_opts,
                 sift_options=sift_opts,
             )
@@ -146,7 +237,7 @@ class SfmRunner:
         if not db_cams:
             logger.info("No cameras found in DB; creating camera record with injected intrinsics")
             new_cam = pycolmap.Camera(
-                model=self.config.camera_model,
+                model=camera_model,
                 width=calibration.width,
                 height=calibration.height,
                 params=calibration.params,
@@ -200,50 +291,25 @@ class SfmRunner:
         )
 
         # -------------------------------------------------------------
-        # Stage 4: Incremental Mapping with Locked Intrinsics
+        # Stage 4: Incremental Mapping
         # -------------------------------------------------------------
         t0 = time.perf_counter()
         logger.info("Stage 4/4: Incremental reconstruction mapping")
 
-        pipeline_opts = pycolmap.IncrementalPipelineOptions()
+        refinement_rejected = False
+        intrinsics_violations: list[str] = []
 
-        # Lock camera intrinsics during bundle adjustment if configured
-        if not self.config.refine_intrinsics:
-            pipeline_opts.ba_refine_focal_length = False
-            pipeline_opts.ba_refine_principal_point = False
-            pipeline_opts.ba_refine_extra_params = False
-            pipeline_opts.mapper.abs_pose_refine_focal_length = False
-            pipeline_opts.mapper.abs_pose_refine_extra_params = False
-            logger.info("Intrinsics refinement locked: ba_refine_* and abs_pose_refine_* disabled")
+        if self.config.refine_intrinsics:
+            logger.info("Intrinsics refinement enabled for this run (bounded by the plausibility gate).")
 
-        # Configurable mapper thresholds
-        pipeline_opts.mapper.init_min_tri_angle = self.config.init_min_tri_angle
-        pipeline_opts.mapper.init_min_num_inliers = self.config.init_min_inliers
-        pipeline_opts.mapper.abs_pose_min_num_inliers = self.config.abs_pose_min_inliers
-        pipeline_opts.min_model_size = self.config.min_model_size
-        pipeline_opts.ignore_watermarks = self.config.ignore_watermarks
-
-        try:
-            reconstructions = pycolmap.incremental_mapping(
-                database_path=str(database_path),
-                image_path=str(img_path),
-                output_path=str(sparse_dir),
-                options=pipeline_opts,
-            )
-        except Exception as exc:
-            raise Uav3dError(f"Incremental mapping failed with exception: {exc}") from exc
-
-        profiles.append(
-            SfmStageProfile(
-                stage_name="incremental_mapping",
-                wall_time_s=time.perf_counter() - t0,
-                peak_rss_mb=get_peak_rss_mb(),
-            )
+        reconstructions = self._run_mapping(
+            database_path=database_path,
+            image_path=img_path,
+            output_dir=sparse_dir,
+            refine=self.config.refine_intrinsics,
         )
+        mapping_time_s = time.perf_counter() - t0
 
-        # -------------------------------------------------------------
-        # Model Selection & Locked Intrinsics Assertion
-        # -------------------------------------------------------------
         if not reconstructions:
             raise Uav3dError(
                 f"COLMAP incremental mapping produced 0 valid reconstructions from {total_images} images. "
@@ -251,38 +317,100 @@ class SfmRunner:
             )
 
         num_models = len(reconstructions)
-        logger.info(f"Reconstruction produced {num_models} model(s)")
-
-        # Select largest reconstruction by number of registered images
         selected_rec = max(reconstructions.values(), key=lambda r: r.num_reg_images())
-        num_reg = selected_rec.num_reg_images()
 
+        # -------------------------------------------------------------
+        # Post-BA camera verification
+        #
+        # Locked mode: intrinsics must be bit-for-bit unchanged.
+        # Refined mode: intrinsics are free, so they are instead gated on
+        # physical plausibility (focal length -> FoV window, isotropy,
+        # principal point location).
+        #
+        # If a refinement run fails the gate, the run is redone with the
+        # supplied intrinsics locked. That is strictly better than exporting a
+        # camera that cannot exist (e.g. fx=213 px, fy=745 px on a 1920 px
+        # frame), and it is reported rather than hidden.
+        # -------------------------------------------------------------
+        expected_params = [float(p) for p in calibration.params]
+        initial_params = list(expected_params)
+
+        if self.config.refine_intrinsics:
+            model_name = self._camera_model_name(selected_rec, camera_model)
+            final_candidate = [float(p) for p in self._first_camera(selected_rec).params]
+            intrinsics_violations = check_intrinsics_sanity(
+                params=final_candidate,
+                model=model_name,
+                width=int(self._first_camera(selected_rec).width),
+                height=int(self._first_camera(selected_rec).height),
+                min_fov_deg=self.config.video_min_fov_deg,
+                max_fov_deg=self.config.video_max_fov_deg,
+            )
+            if intrinsics_violations:
+                message = (
+                    "Refined camera intrinsics failed the plausibility gate: " + "; ".join(intrinsics_violations)
+                )
+                if self.config.allow_unbounded_intrinsics:
+                    logger.warning(message + " (allow_unbounded_intrinsics=True: keeping refined values)")
+                    logger.info(f"Camera post-BA parameters (refined, unbounded): {final_candidate}")
+                else:
+                    logger.error(
+                        message + " Falling back to the supplied intrinsics with refinement disabled."
+                    )
+                    refinement_rejected = True
+                    locked_dir = sparse_dir.parent / "sparse_locked"
+                    locked = self._run_mapping(
+                        database_path=database_path,
+                        image_path=img_path,
+                        output_dir=locked_dir,
+                        refine=False,
+                    )
+                    if not locked:
+                        raise Uav3dError(
+                            "Intrinsics refinement was rejected as implausible and the locked re-run "
+                            "produced no reconstruction. Provide a calibrated focal length "
+                            "(sfm.video_focal_px or --focal-px)."
+                        )
+                    selected_rec = max(locked.values(), key=lambda r: r.num_reg_images())
+                    num_models = len(locked)
+                    sparse_dir = locked_dir
+                    mapping_time_s += time.perf_counter() - t0 - mapping_time_s
+
+        profiles.append(
+            SfmStageProfile(
+                stage_name="incremental_mapping",
+                wall_time_s=mapping_time_s,
+                peak_rss_mb=get_peak_rss_mb(),
+            )
+        )
+
+        final_params = [float(p) for p in self._first_camera(selected_rec).params]
+
+        if not self.config.refine_intrinsics or refinement_rejected:
+            logger.info(
+                f"Camera post-BA parameters (locked): {final_params} (expected: {initial_params})"
+            )
+            if not np.allclose(np.array(final_params), np.array(expected_params), atol=1e-3):
+                raise Uav3dError(
+                    "Camera intrinsics were modified during bundle adjustment despite "
+                    f"refine_intrinsics=False! Expected: {expected_params}, Got: {final_params}"
+                )
+        else:
+            logger.info(f"Camera post-BA parameters (refined): {final_params} (initial: {initial_params})")
+
+        final_fov_deg: float | None = None
+        fov = horizontal_fov_deg(final_params, calibration.width)
+        final_fov_deg = round(fov, 2) if np.isfinite(fov) else None
+
+        num_reg = selected_rec.num_reg_images()
         if num_reg == 0:
             raise Uav3dError("Selected reconstruction contains 0 registered images.")
-
         reg_rate = float(num_reg / max(1, total_images))
         mean_reproj = (
             float(selected_rec.compute_mean_reprojection_error())
             if hasattr(selected_rec, "compute_mean_reprojection_error")
             else 0.0
         )
-
-        # Assert and verify locked intrinsics post-bundle adjustment
-        for cam_id, cam in selected_rec.cameras.items():
-            actual_params = np.array(cam.params, dtype=np.float64)
-            expected_params = np.array(calibration.params, dtype=np.float64)
-
-            logger.info(
-                f"Camera #{cam_id} post-BA parameters: {actual_params.tolist()} "
-                f"(expected: {expected_params.tolist()})"
-            )
-
-            if not self.config.refine_intrinsics:
-                if not np.allclose(actual_params, expected_params, atol=1e-3):
-                    raise Uav3dError(
-                        f"Camera intrinsics were modified during bundle adjustment despite refine_intrinsics=False! "
-                        f"Expected: {expected_params.tolist()}, Got: {actual_params.tolist()}"
-                    )
 
         overall_time = time.perf_counter() - overall_start
         peak_rss = get_peak_rss_mb()
@@ -304,4 +432,10 @@ class SfmRunner:
             profiles=profiles,
             total_wall_time_s=overall_time,
             peak_rss_mb=peak_rss,
+            intrinsics_refined=bool(self.config.refine_intrinsics) and not refinement_rejected,
+            initial_params=initial_params,
+            final_params=final_params,
+            final_fov_deg=final_fov_deg,
+            intrinsics_violations=intrinsics_violations,
+            refinement_rejected=refinement_rejected,
         )

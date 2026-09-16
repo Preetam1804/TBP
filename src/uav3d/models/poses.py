@@ -91,6 +91,22 @@ class SfmCameraBlock(BaseModel):
     height: int = Field(..., description="Working image height in pixels", gt=0)
     params: list[float] = Field(..., description="Final verified camera intrinsic parameters")
     scale_factor: float = Field(default=1.0, description="Image scale factor applied relative to native source resolution")
+    intrinsics_locked: bool = Field(
+        default=True,
+        description="True when bundle adjustment was forbidden from changing intrinsics",
+    )
+    initial_params: list[float] | None = Field(
+        default=None,
+        description="Intrinsics supplied before bundle adjustment (differs from params when refined)",
+    )
+    horizontal_fov_deg: float | None = Field(
+        default=None,
+        description="Horizontal field of view in degrees implied by the final intrinsics",
+    )
+    intrinsics_source: str | None = Field(
+        default=None,
+        description="Provenance of the intrinsics (e.g. calibration_data.npz, video_estimate_*)",
+    )
 
 
 class PosesFile(BaseModel):
