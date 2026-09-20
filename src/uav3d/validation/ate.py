@@ -4,7 +4,6 @@ Strictly consumes GroundTruthAGL for evaluation only. Never consumed by visual S
 """
 
 import logging
-import re
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +11,7 @@ import numpy as np
 from uav3d.exceptions import Uav3dError
 from uav3d.models.poses import PosesFile
 from uav3d.models.validation import AteMetrics, AteReport, PerFrameAte
+from uav3d.telemetry.frame_ids import numeric_suffix, validate_frame_id_mapping
 from uav3d.telemetry.zurich_parser import ZurichGroundTruthRecord, parse_ground_truth_agl
 
 logger = logging.getLogger("uav3d.validation.ate")
@@ -161,8 +161,9 @@ def compute_ate(
     else:
         raise TypeError(f"Expected dict or Path for gt_records, got {type(gt_records)}")
 
-    # 2. Extract numeric image ID from frame_ids and find common matches
-    num_pattern = re.compile(r"(\d+)$")
+    # 2. Extract numeric image IDs from frame_ids and find common matches.
+    # The numeric-suffix join is validated first so unrelated ids can never be paired.
+    validate_frame_id_mapping([pose.frame_id for pose in poses_file.poses], context="ATE validation")
 
     matched_frame_ids: list[str] = []
     est_points_list: list[list[float]] = []
@@ -173,11 +174,10 @@ def compute_ate(
             continue
 
         fid = pose.frame_id
-        match = num_pattern.search(fid)
-        if not match:
+        num_id = numeric_suffix(fid)
+        if num_id is None:
             continue
 
-        num_id = int(match.group(1))
         gt_entry = parsed_gt.get(num_id)
         if gt_entry is not None:
             matched_frame_ids.append(fid)

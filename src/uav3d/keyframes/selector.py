@@ -40,6 +40,10 @@ class SelectionSummary:
     final_stride: int
     stride_reductions: int
     blur_dist: MetricDistribution
+    effective_min_blur: float
+    min_blur_mode: str
+    rejected_by_blur: int
+    rejected_by_clipping: int
     brightness_dist: MetricDistribution
     clipping_dist: MetricDistribution
     features_dist: MetricDistribution
@@ -56,6 +60,8 @@ class KeyframeSelector:
         self.initial_stride = config.stride
         self.max_frames = config.max_frames
         self.min_blur = config.min_blur
+        self.min_blur_mode = config.min_blur_mode
+        self.blur_percentile = config.blur_percentile
         self.max_clipping = config.max_clipping
         self.max_gap = config.max_gap
         self.orb_features = config.orb_features
@@ -192,6 +198,25 @@ class KeyframeSelector:
                     all_clipping.append(metrics.clipping_ratio)
                     all_features.append(float(metrics.feature_count))
 
+        # 2b. Resolve the effective blur gate.
+        # Absolute thresholds are imagery- and resolution-dependent (the metrics are computed on a
+        # grayscale frame resized to a fixed analysis width), so "adaptive" mode gates on the
+        # observed distribution instead of a constant that was tuned on other imagery.
+        analyzed_blurs = [m.blur_score for m in metrics_cache.values() if m is not None]
+        if self.min_blur_mode == "adaptive" and analyzed_blurs:
+            effective_min_blur = float(np.percentile(analyzed_blurs, self.blur_percentile))
+            logger.info(
+                f"Adaptive blur gate: p{self.blur_percentile:g} of {len(analyzed_blurs)} analysed frames "
+                f"= {effective_min_blur:.2f} (absolute min_blur={self.min_blur:.2f} not applied)"
+            )
+        else:
+            if self.min_blur_mode == "adaptive":
+                logger.warning("Adaptive blur gate requested but no frames could be analysed; using absolute min_blur")
+            effective_min_blur = self.min_blur
+
+        rejected_blur = 0
+        rejected_clipping = 0
+
         # 3. Iterative selection with Overlap Guard
         current_stride = self.initial_stride
         stride_reductions = 0
@@ -211,10 +236,12 @@ class KeyframeSelector:
                 if metrics is None:
                     continue
 
-                # Quality gates
-                if metrics.blur_score < self.min_blur:
+                # Quality gates (diagnostics collected so a mis-calibrated threshold is visible)
+                if metrics.blur_score < effective_min_blur:
+                    rejected_blur += 1
                     continue
                 if metrics.clipping_ratio > self.max_clipping:
+                    rejected_clipping += 1
                     continue
 
                 candidate_indices.append(idx)
@@ -323,12 +350,40 @@ class KeyframeSelector:
                 except (OSError, NotImplementedError):
                     shutil.copy2(orig_path, dest_path)
 
+        sel_blurs = [rec.metrics["blur_score"] for rec in selected_records if rec.metrics]
+
+        # 6b. Calibration diagnostics: a gate that rejects nothing (or nearly everything) is
+        # almost always a threshold carried over from different imagery / resolution.
+        gated_total = rejected_blur + rejected_clipping + len(selected_records)
+        if gated_total > 0:
+            rejected_fraction = (rejected_blur + rejected_clipping) / gated_total
+            logger.info(
+                f"Quality gates: rejected {rejected_blur} by blur (< {effective_min_blur:.2f}) and "
+                f"{rejected_clipping} by clipping (> {self.max_clipping:.3f}); "
+                f"kept {len(selected_records)}"
+            )
+            if rejected_blur == 0 and self.min_blur_mode == "adaptive":
+                logger.warning(
+                    "Adaptive blur gate rejected no frames; the observed blur distribution may be "
+                    "too narrow for percentile gating"
+                )
+            elif rejected_blur == 0 and selected_records:
+                logger.warning(
+                    f"min_blur={self.min_blur:.2f} rejected no frames "
+                    f"(selected blur median {self._calc_distribution(sel_blurs).median_val:.2f}); it is likely "
+                    "calibrated for different imagery or a different analysis width"
+                )
+            elif rejected_fraction > 0.5:
+                logger.warning(
+                    f"Quality gates rejected {rejected_fraction * 100:.0f}% of candidates "
+                    f"(blur gate {effective_min_blur:.2f}); check min_blur/max_clipping for this dataset"
+                )
+
         # 7. Generate contact sheet
         contact_sheet_path = debug_dir / "contact_sheet.jpg"
         self._generate_contact_sheet(selected_records, sfm_images_dir, contact_sheet_path)
 
         # Distributions of selected frames
-        sel_blurs = [rec.metrics["blur_score"] for rec in selected_records if rec.metrics]
         sel_bright = [rec.metrics["brightness_mean"] for rec in selected_records if rec.metrics]
         sel_clip = [rec.metrics["clipping_ratio"] for rec in selected_records if rec.metrics]
         sel_feats = [rec.metrics["feature_count"] for rec in selected_records if rec.metrics]
@@ -341,6 +396,10 @@ class KeyframeSelector:
             final_stride=current_stride,
             stride_reductions=stride_reductions,
             blur_dist=self._calc_distribution(sel_blurs or all_blur_scores),
+            effective_min_blur=round(effective_min_blur, 4),
+            min_blur_mode=self.min_blur_mode,
+            rejected_by_blur=rejected_blur,
+            rejected_by_clipping=rejected_clipping,
             brightness_dist=self._calc_distribution(sel_bright or all_brightness),
             clipping_dist=self._calc_distribution(sel_clip or all_clipping),
             features_dist=self._calc_distribution(sel_feats or all_features),

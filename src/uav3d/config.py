@@ -39,7 +39,28 @@ class KeyframeConfig(BaseModel):
         gt=0,
         description="Maximum number of keyframes to select (selection is uniformly subsampled, not truncated)",
     )
-    min_blur: float = Field(default=60.0, ge=0.0, description="Minimum Laplacian variance blur score threshold")
+    min_blur: float = Field(
+        default=60.0,
+        ge=0.0,
+        description=(
+            "Absolute Laplacian-variance blur threshold, applied when min_blur_mode=absolute. "
+            "Absolute values depend on the analysis width (quality.analysis_width_px) and on the imagery, "
+            "so they must be calibrated for the dataset actually being processed"
+        ),
+    )
+    min_blur_mode: Literal["absolute", "adaptive"] = Field(
+        default="absolute",
+        description=(
+            "Blur gating mode: 'absolute' uses min_blur, 'adaptive' uses the blur_percentile of the "
+            "frames analysed in this run (recommended when the imagery differs from the calibration set)"
+        ),
+    )
+    blur_percentile: float = Field(
+        default=5.0,
+        gt=0.0,
+        lt=100.0,
+        description="Percentile used as the blur gate when min_blur_mode=adaptive",
+    )
     max_clipping: float = Field(default=0.05, ge=0.0, le=1.0, description="Maximum allowed pixel clipping ratio")
     max_gap: int = Field(default=15, ge=1, description="Maximum allowed source frame index gap between consecutive keyframes")
     orb_features: int = Field(default=2000, gt=0, description="Maximum ORB feature count cap")

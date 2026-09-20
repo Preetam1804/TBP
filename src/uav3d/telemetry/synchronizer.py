@@ -20,6 +20,7 @@ from uav3d.config import SyncConfig
 from uav3d.models.keyframes import KeyframeRecord, KeyframesFile
 from uav3d.models.poses import PoseRecord, PosesFile
 from uav3d.models.telemetry import TelemetryFile, TelemetryRecord
+from uav3d.telemetry.frame_ids import numeric_suffix, validate_frame_id_mapping
 from uav3d.telemetry.zurich_parser import ZurichGpsRecord, parse_onboard_gps
 
 logger = logging.getLogger("uav3d.telemetry.synchronizer")
@@ -205,15 +206,13 @@ class TelemetrySynchronizer:
         enriched_poses: list[PoseRecord] = []
         matched_count = 0
 
-        # Pattern for numeric frame ID extraction
-        num_pattern = re.compile(r"(\d+)$")
-
-        # Join on source_image_id
+        # Join on source_image_id; validate the numeric-suffix mapping before using it.
+        id_mapping = validate_frame_id_mapping(
+            [pose.frame_id for pose in poses.poses], context="telemetry synchronization"
+        )
         for pose in poses.poses:
             fid = pose.frame_id
-            match = num_pattern.search(fid)
-            num_id = int(match.group(1)) if match else None
-
+            num_id = numeric_suffix(fid)
             gps_entry = gps_by_id.get(num_id) if num_id is not None else None
 
             if gps_entry is not None:
@@ -247,11 +246,17 @@ class TelemetrySynchronizer:
             p_dict["telemetry_recorded"] = has_gps
             enriched_poses.append(PoseRecord(**p_dict))
 
-        # Check for unregistered frames if any, also include in telemetry mapping
-        for unreg in poses.unregistered_frames:
-            unreg_fid = unreg.frame_id if hasattr(unreg, "frame_id") else str(unreg)
-            match = num_pattern.search(unreg_fid)
-            num_id = int(match.group(1)) if match else None
+        # Check for unregistered frames if any, also include in telemetry mapping.
+        # Their ids participate in the same validated mapping as registered frames.
+        unregistered_fids = [
+            unreg.frame_id if hasattr(unreg, "frame_id") else str(unreg) for unreg in poses.unregistered_frames
+        ]
+        if unregistered_fids:
+            validate_frame_id_mapping(
+                [*id_mapping.values(), *unregistered_fids], context="telemetry synchronization (unregistered frames)"
+            )
+        for unreg_fid in unregistered_fids:
+            num_id = numeric_suffix(unreg_fid)
             gps_entry = gps_by_id.get(num_id) if num_id is not None else None
             if gps_entry is not None:
                 telemetry_records.append(
@@ -552,13 +557,14 @@ class TelemetrySynchronizer:
         enriched_poses: list[PoseRecord] = []
         matched_count = 0
 
+        validate_frame_id_mapping([pose.frame_id for pose in poses.poses], context="manifest synchronization")
         for pose in poses.poses:
             fid = pose.frame_id
             entry = manifest_by_fid.get(fid)
             if entry is None:
-                match = re.search(r"(\d+)$", fid)
-                if match:
-                    entry = manifest_by_idx.get(int(match.group(1)))
+                num_id = numeric_suffix(fid)
+                if num_id is not None:
+                    entry = manifest_by_idx.get(num_id)
 
             p_dict = pose.model_dump()
             if entry:

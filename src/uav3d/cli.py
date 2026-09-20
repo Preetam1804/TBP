@@ -568,7 +568,10 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         if not poses_path.exists():
             raise Uav3dError(f"poses.json does not exist in {run_dir}. Run 'uav3d sfm' first.")
 
-        # 2. Resolve ground truth file
+        # 2. Load poses.json (needed to decide which ground truth belongs to this run)
+        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
+
+        # 3. Resolve ground truth file
         gt_file = None
         if getattr(args, "gt_file", None):
             gt_file = Path(args.gt_file).expanduser().resolve()
@@ -617,9 +620,6 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
             )
 
         logger.info(f"Using ground truth file: {gt_file}")
-
-        # 3. Load poses.json
-        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
 
         # 4. Compute ATE metrics and alignment
         ate_report = compute_ate(
