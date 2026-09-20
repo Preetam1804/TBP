@@ -139,19 +139,17 @@ class KeyframeSelector:
         )
 
         if is_video_source:
-            video_file = str(getattr(source, "video_path", first_frame_path))
-            cap = cv2.VideoCapture(video_file)
-            try:
-                frame_idx = 0
-                while cap.isOpened() and frame_idx < total_frames:
-                    ret, bgr = cap.read()
-                    if not ret or bgr is None:
-                        decode_failed_count += 1
-                        frame_idx += 1
-                        continue
+            # Decode metrics only for the frames the source selected (not the whole video).
+            records_by_index = {
+                int(re.search(r"(\d+)$", frame.frame_id).group(1)): frame for frame in frames
+            }
+            decoded: set[str] = set()
+            if hasattr(source, "iter_frames_with_pixels"):
+                decoded_indices = sorted(records_by_index)
+                for record, bgr in source.iter_frames_with_pixels(decoded_indices):
                     metrics = compute_frame_quality(bgr, orb_features=self.orb_features)
-                    fid = frames[frame_idx].frame_id
-                    metrics_cache[fid] = metrics
+                    metrics_cache[record.frame_id] = metrics
+                    decoded.add(record.frame_id)
                     if metrics is None:
                         decode_failed_count += 1
                     else:
@@ -159,9 +157,28 @@ class KeyframeSelector:
                         all_brightness.append(metrics.brightness_mean)
                         all_clipping.append(metrics.clipping_ratio)
                         all_features.append(float(metrics.feature_count))
-                    frame_idx += 1
-            finally:
-                cap.release()
+            else:  # pragma: no cover - protocol fallback for non-video helpers
+                cap = cv2.VideoCapture(str(getattr(source, "video_path", first_frame_path)))
+                try:
+                    for idx in sorted(records_by_index):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        ret, bgr = cap.read()
+                        fid = records_by_index[idx].frame_id
+                        metrics = compute_frame_quality(bgr, orb_features=self.orb_features) if ret else None
+                        metrics_cache[fid] = metrics
+                        decoded.add(fid)
+                        if metrics is None:
+                            decode_failed_count += 1
+                        else:
+                            all_blur_scores.append(metrics.blur_score)
+                            all_brightness.append(metrics.brightness_mean)
+                            all_clipping.append(metrics.clipping_ratio)
+                            all_features.append(float(metrics.feature_count))
+                finally:
+                    cap.release()
+
+            # Frames the source could not deliver are counted once (they were never decoded).
+            decode_failed_count += sum(1 for frame in frames if frame.frame_id not in decoded)
         else:
             for frame in frames:
                 img_path = self._resolve_image_path(frame, source)
@@ -239,11 +256,18 @@ class KeyframeSelector:
             selected_records = candidate_records
             break
 
-        # 4. Cap at max_frames
+        # 4. Cap at max_frames by uniform subsampling.
+        # Truncating the tail would silently cover only the beginning of the flight and hand
+        # SfM/ATE a partial trajectory while still reporting a full-run KPI.
         if len(selected_records) > self.max_frames:
-            logger.info(f"Capping selected keyframes from {len(selected_records)} to max_frames={self.max_frames}")
-            selected_records = selected_records[: self.max_frames]
-            selected_indices = selected_indices[: self.max_frames]
+            keep = np.linspace(0, len(selected_records) - 1, self.max_frames).round().astype(int)
+            keep = np.unique(keep)  # defensive: guarantee strictly increasing, unique source indices
+            logger.info(
+                f"Subsampling {len(selected_records)} candidate keyframes to max_frames={self.max_frames} "
+                f"(covering frame ids {selected_records[keep[0]].frame_id} .. {selected_records[keep[-1]].frame_id})"
+            )
+            selected_records = [selected_records[i] for i in keep]
+            selected_indices = [selected_indices[i] for i in keep]
 
         logger.info(
             f"Selection completed: {len(selected_records)}/{total_frames} frames selected "
@@ -262,23 +286,27 @@ class KeyframeSelector:
 
         # 6. Save selected keyframes to sfm/images/{frame_id}.jpg
         if is_video_source:
-            video_file = str(getattr(source, "video_path", first_frame_path))
-            cap = cv2.VideoCapture(video_file)
-            try:
-                for rec in selected_records:
-                    match = re.search(r"(\d+)$", rec.frame_id)
-                    if not match:
-                        continue
-                    idx = int(match.group(1))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, bgr = cap.read()
-                    dest_path = sfm_images_dir / f"{rec.frame_id}.jpg"
-                    if ret and bgr is not None:
-                        cv2.imwrite(str(dest_path), bgr)
-                    else:
-                        logger.warning(f"Failed to read frame index {idx} from video {video_file}")
-            finally:
-                cap.release()
+            # Single sequential decode pass over the selected keyframes only.
+            indices = [idx for rec in selected_records if (match := re.search(r"(\d+)$", rec.frame_id)) for idx in [int(match.group(1))]]
+            index_to_record = {int(re.search(r"(\d+)$", rec.frame_id).group(1)): rec for rec in selected_records}
+            if hasattr(source, "iter_frames_with_pixels"):
+                for record, bgr in source.iter_frames_with_pixels(indices):
+                    dest_path = sfm_images_dir / f"{record.frame_id}.jpg"
+                    cv2.imwrite(str(dest_path), bgr)
+            else:  # pragma: no cover - protocol fallback for non-video helpers
+                video_file = str(getattr(source, "video_path", first_frame_path))
+                cap = cv2.VideoCapture(video_file)
+                try:
+                    for idx in indices:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        ret, bgr = cap.read()
+                        dest_path = sfm_images_dir / f"{index_to_record[idx].frame_id}.jpg"
+                        if ret and bgr is not None:
+                            cv2.imwrite(str(dest_path), bgr)
+                        else:
+                            logger.warning(f"Failed to read frame index {idx} from video {video_file}")
+                finally:
+                    cap.release()
         else:
             for rec in selected_records:
                 # Find original frame path

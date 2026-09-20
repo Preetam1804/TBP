@@ -2,10 +2,10 @@
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from uav3d.exceptions import ConfigError
 
@@ -16,8 +16,12 @@ class IngestConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source_type: str = Field(default="zurich", description="Ingestion source type: zurich or video")
-    start_frame: int = Field(default=0, ge=0, description="Start index for processing")
-    max_frames: int = Field(default=300, gt=0, description="Maximum contiguous frames to ingest")
+    start_frame: int = Field(default=0, ge=0, description="First frame index to ingest (video sources)")
+    max_frames: int = Field(
+        default=300,
+        gt=0,
+        description="Maximum contiguous frames to ingest (enforced for video sources)",
+    )
 
 
 class KeyframeConfig(BaseModel):
@@ -25,15 +29,37 @@ class KeyframeConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    strategy: str = Field(default="laplacian_variance", description="Selection algorithm")
+    strategy: Literal["laplacian_variance"] = Field(
+        default="laplacian_variance",
+        description="Selection algorithm (only deterministic Laplacian-variance gating is implemented)",
+    )
     stride: int = Field(default=2, ge=1, description="Temporal subsampling stride")
-    max_frames: int = Field(default=250, gt=0, description="Maximum number of keyframes to select")
+    max_frames: int = Field(
+        default=250,
+        gt=0,
+        description="Maximum number of keyframes to select (selection is uniformly subsampled, not truncated)",
+    )
     min_blur: float = Field(default=60.0, ge=0.0, description="Minimum Laplacian variance blur score threshold")
     max_clipping: float = Field(default=0.05, ge=0.0, le=1.0, description="Maximum allowed pixel clipping ratio")
     max_gap: int = Field(default=15, ge=1, description="Maximum allowed source frame index gap between consecutive keyframes")
     orb_features: int = Field(default=2000, gt=0, description="Maximum ORB feature count cap")
     sharpness_threshold: float | None = Field(default=None, description="Optional alias for min_blur")
     target_count: int | None = Field(default=None, description="Optional alias for max_frames")
+
+    @model_validator(mode="after")
+    def _resolve_aliases(self) -> "KeyframeConfig":
+        """Resolve the documented alias fields onto their canonical equivalents."""
+        if self.sharpness_threshold is not None:
+            if self.min_blur != type(self).model_fields["min_blur"].default and self.min_blur != self.sharpness_threshold:
+                raise ValueError(
+                    "keyframes.sharpness_threshold conflicts with keyframes.min_blur; set only one of them"
+                )
+            self.min_blur = self.sharpness_threshold
+        if self.target_count is not None:
+            if self.max_frames != type(self).model_fields["max_frames"].default and self.max_frames != self.target_count:
+                raise ValueError("keyframes.target_count conflicts with keyframes.max_frames; set only one of them")
+            self.max_frames = self.target_count
+        return self
 
 
 class SfmConfig(BaseModel):
@@ -46,9 +72,14 @@ class SfmConfig(BaseModel):
     seq_overlap: int = Field(default=10, ge=1, description="Sequential matching overlap window")
     max_image_size: int = Field(default=1600, gt=0, description="Maximum image dimension for feature extraction")
     refine_intrinsics: bool = Field(default=False, description="Whether to refine camera intrinsics during bundle adjustment")
-    feature_type: str = Field(default="SIFT", description="Feature extractor type")
-    matcher_type: str = Field(default="sequential", description="COLMAP matcher type (sequential or exhaustive)")
-    min_num_matches: int = Field(default=15, ge=1, description="Minimum inlier matches for pair")
+    feature_type: Literal["SIFT"] = Field(default="SIFT", description="Feature extractor type (SIFT only)")
+    matcher_type: Literal["sequential"] = Field(
+        default="sequential",
+        description="COLMAP matcher type (sequential only; exhaustive matching is not wired)",
+    )
+    min_num_matches: int = Field(
+        default=15, ge=1, description="Minimum number of verified inlier matches required per image pair"
+    )
     init_min_inliers: int = Field(default=15, ge=1, description="Minimum inliers for initial pair")
     init_min_tri_angle: float = Field(default=2.0, ge=0.0, description="Minimum triangulation angle for initial pair in degrees")
     abs_pose_min_inliers: int = Field(default=10, ge=1, description="Minimum inliers for absolute pose registration")
@@ -62,7 +93,10 @@ class SyncConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_delta_us: int = Field(default=500000, ge=0, description="Max tolerance delta in microseconds (default 500ms)")
-    strategy: str = Field(default="nearest", description="Sync strategy (nearest or linear)")
+    strategy: Literal["nearest"] = Field(
+        default="nearest",
+        description="Sync strategy (only nearest-neighbour timestamp matching is implemented)",
+    )
     estimate_offset: bool = Field(default=True, description="Whether to estimate constant clock offset for Mode B")
     min_match_rate: float = Field(default=0.8, ge=0.0, le=1.0, description="Minimum match rate required for synchronized status")
 
@@ -72,8 +106,15 @@ class ValidationConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    alignment: str = Field(default="sim3", description="Trajectory alignment type: sim3, se3, or none")
-    ate_threshold_meters: float = Field(default=5.0, gt=0.0, description="Absolute Trajectory Error warning threshold")
+    alignment: Literal["sim3"] = Field(
+        default="sim3",
+        description="Trajectory alignment type (only 7-DoF Umeyama Sim(3) is implemented)",
+    )
+    ate_threshold_meters: float = Field(
+        default=5.0,
+        gt=0.0,
+        description="Absolute Trajectory Error RMSE warning threshold in metres (reported as PASS/FAIL)",
+    )
 
 
 class SourceConfig(BaseModel):
@@ -87,6 +128,13 @@ class SourceConfig(BaseModel):
     start_id: int = Field(default=0, ge=0, description="Starting numeric image/frame identifier")
     count: int = Field(default=250, gt=0, le=300, description="Contiguous frame count (<= 300)")
     stride: int = Field(default=1, ge=1, description="Frame sampling stride")
+    allow_default_intrinsics: bool = Field(
+        default=False,
+        description=(
+            "Permit falling back to documented GoPro Hero4 default intrinsics when "
+            "calibration_data.npz is missing or unreadable (default: fail loudly)"
+        ),
+    )
 
 
 class PipelineConfig(BaseModel):

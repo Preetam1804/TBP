@@ -178,6 +178,7 @@ class SfmRunner:
         seq_opts.overlap = self.config.seq_overlap
 
         tvg_opts = pycolmap.TwoViewGeometryOptions()
+        tvg_opts.min_num_inliers = self.config.min_num_matches
         if self.config.ignore_watermarks:
             tvg_opts.detect_watermark = False
 

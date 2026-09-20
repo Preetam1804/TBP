@@ -236,6 +236,8 @@ class TestCliFailsLoudlyWithoutInputs:
         """An explicitly requested config that does not exist must fail, never silently default."""
         missing = tmp_path / "does_not_exist.yaml"
         assert main(["inspect", "--config", str(missing)]) == 1
+        # Rich wraps long lines at the console width, so compare with whitespace removed.
         captured = capsys.readouterr()
-        assert "Configuration file not found" in captured.err
-        assert str(missing) in captured.err
+        compact = "".join(captured.err.split())
+        assert "Configurationfilenotfound" in compact
+        assert str(missing) in compact

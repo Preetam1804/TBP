@@ -164,6 +164,7 @@ def _build_source(cfg: PipelineConfig, data_dir: Path, args: argparse.Namespace)
             start_id=cfg.source.start_id,
             count=cfg.source.count,
             stride=cfg.source.stride,
+            allow_default_intrinsics=cfg.source.allow_default_intrinsics,
         )
     if source_type == "video":
         video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4")).expanduser()

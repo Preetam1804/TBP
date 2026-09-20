@@ -4,6 +4,7 @@ import logging
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -23,6 +24,100 @@ logger = logging.getLogger("uav3d.sources.zurich")
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 
+# Documented fallback intrinsics for the GoPro Hero4 at 1080p (used only when explicitly allowed).
+DEFAULT_INTRINSICS_PINHOLE = [1060.0, 1060.0, 960.0, 540.0]
+
+# Accepted key spellings inside calibration_data.npz (the file is not documented column-by-column).
+_CAMERA_MATRIX_KEYS = ("camera_matrix", "camera_mat", "cameramatrix", "k", "mtx", "intrinsics")
+_DISTORTION_KEYS = ("distortion_coefficients", "distortion", "dist_coeffs", "dist", "d")
+
+# COLMAP camera model -> parameterisation, derived from the distortion coefficient count.
+_MODEL_BY_DISTORTION_COUNT = {
+    0: "PINHOLE",
+    4: "OPENCV",
+    5: "FULL_OPENCV",
+    8: "FULL_OPENCV",
+}
+
+
+def _find_npz_key(keys: tuple[str, ...], available: list[str]) -> str | None:
+    """Return the first available key matching a known spelling (case/format tolerant)."""
+    normalised = {name.lower().replace("-", "_").replace(" ", "_"): name for name in available}
+    for key in keys:
+        if key in normalised:
+            return normalised[key]
+    for key in keys:
+        for normalised_name, original in normalised.items():
+            if key in normalised_name:
+                return original
+    return None
+
+
+def build_camera_calibration(
+    camera_matrix: Any,
+    distortion: Any,
+    width: int = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+    source: str = "calibration_data.npz",
+) -> CameraCalibration:
+    """Build a CameraCalibration from a 3x3 intrinsic matrix and distortion coefficients.
+
+    Maps the OpenCV convention (k1, k2, p1, p2[, k3, k4, k5, k6]) onto the closest COLMAP
+    camera model, and fails loudly for coefficient counts that cannot be represented.
+
+    Args:
+        camera_matrix: 3x3 intrinsic matrix (list/ndarray).
+        distortion: Distortion coefficient sequence (may be empty or all zeros for pinhole).
+        width: Image width in pixels.
+        height: Image height in pixels.
+        source: Provenance label recorded in the output schema.
+
+    Returns:
+        CameraCalibration with COLMAP-compatible params.
+    """
+    k = np.asarray(camera_matrix, dtype=np.float64)
+    if k.shape != (3, 3):
+        raise DataError(f"Camera matrix must be 3x3, got shape {k.shape}")
+
+    fx, fy = float(k[0, 0]), float(k[1, 1])
+    cx, cy = float(k[0, 2]), float(k[1, 2])
+    if fx <= 0.0 or fy <= 0.0:
+        raise DataError(
+            f"Calibration contains non-positive focal lengths (fx={fx}, fy={fy}); the file is not a valid camera matrix"
+        )
+
+    coeffs = np.asarray(distortion, dtype=np.float64).flatten() if distortion is not None else np.zeros(0)
+    coeffs = np.array([c for c in coeffs if np.isfinite(c)], dtype=np.float64)
+
+    if coeffs.size == 0 or np.allclose(coeffs, 0.0):
+        model = "PINHOLE"
+        params = [fx, fy, cx, cy]
+    elif coeffs.size == 4:
+        model = "OPENCV"
+        params = [fx, fy, cx, cy, *coeffs.tolist()]
+    elif coeffs.size == 5:
+        # OpenCV orders k1, k2, p1, p2, k3 -> COLMAP FULL_OPENCV expects k1, k2, p1, p2, k3, k4, k5, k6
+        model = "FULL_OPENCV"
+        params = [fx, fy, cx, cy, *coeffs.tolist(), 0.0, 0.0, 0.0]
+    elif coeffs.size == 8:
+        # OpenCV orders k1, k2, p1, p2, k3, k4, k5, k6 -> COLMAP FULL_OPENCV is identical
+        model = "FULL_OPENCV"
+        params = [fx, fy, cx, cy, *coeffs.tolist()]
+    else:
+        raise DataError(
+            f"Unsupported distortion coefficient count {coeffs.size} in {source}; "
+            "expected 0 (pinhole), 4 (k1,k2,p1,p2), 5 (+k3) or 8 (k1..k6)"
+        )
+
+    logger.info(f"Camera calibration from {source}: model={model}, params={[round(p, 4) for p in params]}")
+    return CameraCalibration(
+        model=model,
+        width=width,
+        height=height,
+        params=params,
+        source=source,
+    )
+
 
 class ZurichSequenceSource(ImageSource):
     """Adapter for the ETH RPG Zurich Urban MAV dataset.
@@ -37,12 +132,14 @@ class ZurichSequenceSource(ImageSource):
         start_id: int = 0,
         count: int = 250,
         stride: int = 1,
+        allow_default_intrinsics: bool = False,
     ) -> None:
         self.dataset_dir = Path(dataset_dir).resolve()
         self.start_id = max(0, start_id)
         # Cap subset count to 300 per specification
         self.count = min(300, max(1, count))
         self.stride = max(1, stride)
+        self.allow_default_intrinsics = allow_default_intrinsics
 
         # 1. Validate paths and discover directory layout
         self.images_dir, self.gps_file, self.gt_file, self.calib_file = self._resolve_dataset_paths()
@@ -233,40 +330,65 @@ class ZurichSequenceSource(ImageSource):
         )
 
     def calibration(self) -> CameraCalibration:
-        """Load intrinsic camera calibration from calibration_data.npz or provide default GoPro Hero4."""
-        if self.calib_file and self.calib_file.exists():
-            try:
-                npz = np.load(self.calib_file)
-                # Standard keys in calibration npz files
-                if "camera_matrix" in npz:
-                    K = npz["camera_matrix"]
-                    fx, fy = float(K[0, 0]), float(K[1, 1])
-                    cx, cy = float(K[0, 2]), float(K[1, 2])
-                    params = [fx, fy, cx, cy]
-                    model = "PINHOLE"
-                    if "distortion_coefficients" in npz:
-                        d = npz["distortion_coefficients"].flatten()
-                        params.extend([float(v) for v in d[:4]])
-                        model = "OPENCV"
-                    return CameraCalibration(
-                        model=model,
-                        width=DEFAULT_WIDTH,
-                        height=DEFAULT_HEIGHT,
-                        params=params,
-                        source=str(self.calib_file.name),
-                    )
-            except (OSError, ValueError, KeyError) as exc:
-                logger.warning(f"Could not load calibration from {self.calib_file}: {exc}")
+        """Load intrinsic calibration from calibration_data.npz.
 
-        # Default calibrated intrinsics for GoPro Hero4 1080p from Zurich MAV dataset
-        # K = [fx: 1060.0, fy: 1060.0, cx: 960.0, cy: 540.0]
-        return CameraCalibration(
-            model="PINHOLE",
-            width=DEFAULT_WIDTH,
-            height=DEFAULT_HEIGHT,
-            params=[1060.0, 1060.0, 960.0, 540.0],
-            source="zurich_default_intrinsics",
-        )
+        The npz key names are not formally documented, so several known spellings are accepted
+        and the available keys are logged. If no camera matrix can be found the run fails loudly
+        (``DataError``) unless ``allow_default_intrinsics`` was explicitly enabled, in which case
+        the documented GoPro Hero4 1080p fallback is used and clearly labelled as such.
+        """
+        if not self.calib_file or not self.calib_file.exists():
+            if self.allow_default_intrinsics:
+                logger.warning(
+                    "No calibration_data.npz found; falling back to the documented GoPro Hero4 defaults "
+                    f"{DEFAULT_INTRINSICS_PINHOLE} (source.allow_default_intrinsics=true)"
+                )
+                return CameraCalibration(
+                    model="PINHOLE",
+                    width=DEFAULT_WIDTH,
+                    height=DEFAULT_HEIGHT,
+                    params=list(DEFAULT_INTRINSICS_PINHOLE),
+                    source="zurich_default_intrinsics",
+                )
+            raise DataError(
+                f"No calibration_data.npz found in {self.dataset_dir}. Provide the dataset calibration file, "
+                "or set source.allow_default_intrinsics: true to use the documented GoPro Hero4 defaults."
+            )
+
+        try:
+            with np.load(self.calib_file) as npz:
+                available_keys = list(npz.files)
+                logger.info(f"calibration_data.npz keys: {available_keys}")
+
+                matrix_key = _find_npz_key(_CAMERA_MATRIX_KEYS, available_keys)
+                if matrix_key is None:
+                    raise DataError(
+                        f"No camera matrix found in {self.calib_file.name}; available keys: {available_keys}. "
+                        f"Expected one of {list(_CAMERA_MATRIX_KEYS)}"
+                    )
+                camera_matrix = npz[matrix_key]
+
+                dist_key = _find_npz_key(_DISTORTION_KEYS, available_keys)
+                distortion = npz[dist_key] if dist_key is not None else None
+                if dist_key is None:
+                    logger.info(
+                        f"No distortion coefficients found in {self.calib_file.name} "
+                        f"(keys: {available_keys}); using a pinhole model"
+                    )
+                else:
+                    logger.info(f"Using '{matrix_key}' and '{dist_key}' from {self.calib_file.name}")
+
+            return build_camera_calibration(
+                camera_matrix=camera_matrix,
+                distortion=distortion,
+                width=DEFAULT_WIDTH,
+                height=DEFAULT_HEIGHT,
+                source=str(self.calib_file.name),
+            )
+        except DataError:
+            raise
+        except (OSError, ValueError, KeyError) as exc:
+            raise DataError(f"Could not load calibration from {self.calib_file}: {exc}") from exc
 
     def iter_frames(self) -> Iterator[FrameRecord]:
         """Lazily iterate over FrameRecords without loading images into memory."""

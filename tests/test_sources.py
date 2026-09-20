@@ -1,6 +1,7 @@
 """Tests for ZurichSequenceSource, VideoFileSource, and telemetry parsers."""
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import yaml
@@ -135,15 +136,39 @@ class TestVideoFileSource:
         frames = list(source.iter_frames())
         assert len(frames) == 10
         assert frames[0].frame_id == "video_000000"
-        assert frames[0].timestamp_source == "video_pts"
+        # A grab-only scan cannot validate container PTS, so it uses the deterministic estimate.
+        assert frames[0].timestamp_source == "video_index_fps_estimate"
+        assert frames[0].timestamp_us == 0
         assert isinstance(frames[0].timestamp_us, int)
         assert frames[9].frame_id == "video_000009"
+        assert frames[9].timestamp_us == 900000  # 10 fps
 
     def test_video_get_frame(self, fake_video_file: Path) -> None:
         source = VideoFileSource(video_path=fake_video_file)
         frame = source.get_frame("video_000005")
         assert frame.frame_id == "video_000005"
         assert frame.timestamp_us == 500000  # 5th frame at 10 fps = 0.5s = 500,000 µs
+        assert frame.timestamp_source == "video_pts"  # validated against index/fps
+
+    def test_video_slice_and_timestamp_consistency(self, fake_video_file: Path) -> None:
+        """The ingest window bounds work and both accessors report identical timestamps."""
+        source = VideoFileSource(video_path=fake_video_file, start_frame=2, max_frames=4, stride=2)
+        meta = source.metadata()
+        assert meta.frame_count == 2
+        assert meta.first_frame_id == "video_000002"
+        assert meta.last_frame_id == "video_000004"
+
+        iterated = {f.frame_id: f.timestamp_us for f in source.iter_frames()}
+        assert list(iterated) == ["video_000002", "video_000004"]
+        for frame_id, timestamp_us in iterated.items():
+            assert source.get_frame(frame_id).timestamp_us == timestamp_us
+
+    def test_long_video_is_not_fully_decoded(self, fake_video_file: Path) -> None:
+        """A bounded slice must decode only the requested frames, not the whole file."""
+        source = VideoFileSource(video_path=fake_video_file, max_frames=3)
+        assert source.metadata().frame_count == 3
+        decoded = [record.frame_id for record, _frame in source.iter_frames_with_pixels()]
+        assert decoded == ["video_000000", "video_000001", "video_000002"]
 
 
 class TestInspectCliWithFixture:
@@ -167,3 +192,76 @@ class TestInspectCliWithFixture:
         # Run inspect via CLI main
         exit_code = main(["inspect", "--config", str(config_path)])
         assert exit_code == 0
+
+
+class TestRealZurichTelemetryFormat:
+    """Regression tests for the real AGZ log layout (documented in the dataset readme.txt).
+
+    OnbordGPS.csv: `1: timestamp, 2: imgid, 3: lat (1E7 deg), 4: lon (1E7 deg),
+    5: alt (1E3 m, millimetres), 6..: accuracy/velocity`.
+    GroundTruthAGL.csv: `1: imgid, 2..4: x_gt, y_gt, z_gt` in WGS 84 / UTM 32N metres.
+    The files may or may not carry a header line.
+    """
+
+    GPS_ROWS: ClassVar[list[str]] = [
+        "1459425600000,0,473769000,85417000,450000,0.1,0.05,3,1.2,2.4,5.0,0.0,0.0,12",
+        "1459425600200,1,473769150,85417018,450100,0.1,0.05,3,1.2,2.4,5.0,0.0,0.0,12",
+        "1459425600400,2,473769300,85417036,450200,0.1,0.05,3,1.2,2.4,5.0,0.0,0.0,12",
+    ]
+
+    def test_headerless_fixed_point_gps_is_normalised(self, tmp_path: Path) -> None:
+        """Lat/lon 1E7 fixed point, altitude millimetres and millisecond stamps are un-scaled."""
+        csv_path = tmp_path / "OnbordGPS.csv"
+        csv_path.write_text("\n".join(self.GPS_ROWS) + "\n", encoding="utf-8")
+
+        records, skipped = parse_onboard_gps(csv_path)
+
+        assert skipped == 0
+        assert sorted(records) == [0, 1, 2], "the first data row must not be consumed as a header"
+        assert records[0].lat == pytest.approx(47.3769)
+        assert records[0].lon == pytest.approx(8.5417)
+        assert records[0].alt == pytest.approx(450.0)
+        assert records[1].lat == pytest.approx(47.376915)
+        assert records[2].alt == pytest.approx(450.2)
+        # 1459425600000 ms since epoch == 2016-03-31T12:00:00Z
+        assert records[0].timestamp_us == 1459425600000000
+        assert records[1].timestamp_us - records[0].timestamp_us == 200000
+        # Traceability of the applied normalisation
+        assert records[0].raw_fields["_lat_scale"] == "1/1e+07"
+        assert records[0].raw_fields["_alt_scale"] == "1/1e+03"
+
+    def test_headers_and_microsecond_stamps_still_work(self, tmp_path: Path) -> None:
+        """A commented header with degree/metre values keeps the legacy behaviour."""
+        csv_path = tmp_path / "OnbordGPS.csv"
+        csv_path.write_text(
+            "# timestamp, image_id, lat, lon, alt\n"
+            "1459425600000000, 7, 47.376900, 8.541700, 450.00\n",
+            encoding="utf-8",
+        )
+        records, _ = parse_onboard_gps(csv_path)
+        assert records[7].timestamp_us == 1459425600000000
+        assert records[7].lat == pytest.approx(47.3769)
+        assert records[7].alt == pytest.approx(450.0)
+
+    def test_impossible_coordinates_fail_loudly(self, tmp_path: Path) -> None:
+        """A latitude that cannot be degrees or 1E7-scaled degrees must be rejected, not stored."""
+        csv_path = tmp_path / "OnbordGPS.csv"
+        csv_path.write_text("1459425600000, 0, 9999999999, 85417000, 450000\n", encoding="utf-8")
+        records, skipped = parse_onboard_gps(csv_path)
+        assert skipped == 1
+        assert records == {}
+
+    def test_headerless_ground_truth(self, tmp_path: Path) -> None:
+        """GroundTruthAGL.csv without a header keeps every row."""
+        csv_path = tmp_path / "GroundTruthAGL.csv"
+        csv_path.write_text(
+            "0, 683100.0, 5248200.0, 450.0\n"
+            "1, 683110.0, 5248210.0, 451.0\n"
+            "2, 683120.0, 5248220.0, 452.0\n",
+            encoding="utf-8",
+        )
+        records, skipped = parse_ground_truth_agl(csv_path)
+        assert skipped == 0
+        assert sorted(records) == [0, 1, 2]
+        assert records[0].x == pytest.approx(683100.0)
+        assert records[0].is_evaluation_only is True
