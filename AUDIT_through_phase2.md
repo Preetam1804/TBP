@@ -517,3 +517,44 @@ python -c "from uav3d.telemetry.zurich_parser import parse_onboard_gps as p; \
   from uav3d.telemetry.synchronizer import recommend_crs as r; \
   recs,_=p('/tmp/real_format_gps.csv'); print(recs); print(r([x.lat for x in recs.values()],[x.lon for x in recs.values()]))"
 ```
+
+---
+
+## Fix Status (2026-09-20)
+
+All findings from sections A–E have been fixed, verified and committed on this branch
+(`d8aab11`, `5a995f1`, `326311f`, `fd13ccf`, `b06ff98`, plus the B7/E1/docs commit). Nothing is
+deferred except the P2 items that need a human decision (see "Left to the team" below).
+
+| Finding | Status | Fix / evidence |
+| :--- | :--- | :--- |
+| A1 `pytest` fails on a clean checkout | **Fixed** | `import pytest` restored; non-hermetic CLI smoke tests replaced by fixture-based success + failure-path tests. `python -m pytest` → 81 passed. |
+| A2 no ruff config, 34 findings | **Fixed** | `[tool.ruff]`/`[tool.ruff.lint]` pinned; dead imports, B905/SIM102/SIM108/RUF059/F821 cleared. `ruff check .` → All checks passed. |
+| A3 tests depend on CWD | **Fixed** | Repo-root fixture + autouse chdir in `tests/conftest.py`; repo-relative config paths. |
+| B1 GPS stored in raw 1E7 / 1E3 units | **Fixed** | `zurich_parser` normalises lat/lon (1E7) and altitude (1E3) with per-row provenance in `raw_fields`; impossible coordinates raise `DataError`. Regression tests in `TestRealZurichTelemetryFormat`. |
+| B2 first CSV row eaten as header | **Fixed** | Header detection peeks the first non-empty, non-comment row and treats all-numeric rows as data (positional columns). |
+| B3 `--data-dir`/env ignored `source.dataset_dir` | **Fixed** | `_resolve_data_dir` (outputs only) + `_resolve_dataset_dir` (dataset) with documented fallbacks and a new `--dataset-dir`. Verified with 5 invocation styles → 50 frames / 49 GPS rows each. |
+| B4 npz keys assumed; silent PINHOLE fallback | **Fixed** | Keys discovered from `npz.files` (`camera_matrix`/`K`/`mtx`, `distortion_coefficients`/`dist`/`D`), mapped to PINHOLE/OPENCV/FULL_OPENCV by coefficient count; missing/invalid calibration raises unless `source.allow_default_intrinsics: true`. |
+| B5 duplicate ids / stem guessing | **Fixed** | Numeric-suffix joins go through `validate_frame_id_mapping` (rejects duplicate numbers, mixed prefixes, missing suffix); duplicate image ids raise instead of overwriting; layout is logged. |
+| B6 gates calibrated on synthetic imagery | **Fixed** | Metrics record their normalisation (`analysis_width_px`); gate reports rejections and warns when a threshold rejects nothing or >50%; `keyframes.min_blur_mode: adaptive` (+`blur_percentile`) added; `configs/zurich_baseline.yaml` documents that `min_blur` must be re-calibrated on real frames. |
+| B7 generator can corrupt a real dataset | **Fixed** | Default output is `data/synthetic/zurich_mav`; refuses non-empty/real dataset dirs and existing `calibration_data.npz` (exit 1) unless `--force`/`--overwrite-calibration`. Verified against a real-format directory: refusal + files untouched. |
+| C1 `max_frames` truncated the tail | **Fixed** | Uniform subsampling across all candidates; verified 50 → 8 frames spanning `zurich_000000`..`zurich_000049`. |
+| C2 video ignored caps; 3 full decodes | **Fixed** | `ingest.start_frame`/`max_frames`/`stride` bound the slice; grab-only scan + pixel iterator decode each selected frame once; bounded LRU cache. |
+| C3 manifest unreachable from CLI | **Fixed** | `sync` auto-discovers `<video_dir>/manifest.json` and accepts `--manifest`; `--mode auto` picks video mode. Verified: `sync_status=manifest`, 30/30 matched. |
+| C4 video SfM unvalidated | **Fixed** | `make_synthetic_video.py` renders a persistent 3D landmark cloud (plus manifest and evaluation-only ground truth); the full video chain now runs 30/30 registered, 1.159 px, ATE 0.5468 m. |
+| C5 two timestamp rules for one frame | **Fixed** | One validated rule (`_timestamp_for`): container PTS accepted only within 1/fps+10 ms of the index/fps estimate; the source of each timestamp is recorded. |
+| D1 missing `--config` silently ignored | **Fixed** | `_load_pipeline_config` raises `ConfigError` (exit 1) for an explicitly requested missing file; the repo baseline is used only when no `--config` is given. Test: `TestCliFailsLoudlyWithoutInputs`. |
+| D2 10 dead config keys | **Fixed** | `ingest.*`, `sfm.min_num_matches`, `sharpness_threshold`/`target_count` aliases, KPI thresholds and `validation.*` are now consumed; unimplemented choices are `Literal`-restricted so they cannot be silently ignored. |
+| D3 run pick by name order | **Fixed** | `_latest_run_dir` selects by mtime among runs that contain the required artifacts and logs the choice; `--run-dir` unchanged. |
+| D4 two different focal guesses | **Fixed** | Single exported constant `DEFAULT_FOCAL_RATIO` (0.9) used by both the source calibration and the SfM auto-config. |
+| E1 synthetic numbers presented as real | **Fixed** | `phase_state.md` results relabelled "Synthetic-sample Results" and refreshed from a post-fix run; provenance note added with reproduction commands; `README.md` documents dataset placement. |
+| E2 report hardcodes outcomes | **Fixed** | `SP1_REPORT.md` derives every KPI value, target, PASS/FAIL, dropped-frame count, camera model/params, stride/blur gate, sync status and CRS from the run artifacts + config. Verified by re-running validate with `ate_threshold_meters: 1.0` → report shows `FAILED`. |
+| E3 silent folder choice / asymmetric duplicate handling | **Fixed** | Image folders are chosen in name order with a warning; duplicate ids raise; `sources.base` no longer exposes private `_gps_records` to the CLI. |
+
+### Left to the team (needs a human decision, not a bug)
+
+- **`LICENSE`** — the repository has none; choosing a license is a policy decision.
+- **`Makefile`/CI workflow** — `ruff check .`, `pytest`, `uv lock --check` are now all green and CI-ready,
+  but wiring up a provider (GitHub Actions) and branch protection is outside this pass.
+- **`min_blur` re-calibration on real imagery** — the gate is now observable and switchable to
+  `adaptive`; picking the final absolute value requires the real AGZ frames (not available in the sandbox).

@@ -7,12 +7,19 @@ dataset_label: "replayed public dataset (Zurich Urban MAV) — not field-flight 
 
 source:
   type: "zurich"
+  # Directory holding the AGZ layout (MAV Images/, Log Files/, calibration_data.npz).
+  # Resolved relative to the working directory; --dataset-dir overrides it, and --data-dir
+  # only relocates outputs (it never changes which dataset is read).
   dataset_dir: "data/raw/zurich_mav"
   start_id: 0
   count: 250
   stride: 1
+  # Fail loudly when calibration_data.npz is missing/incomplete instead of assuming
+  # GoPro Hero4 defaults. Set to true only for exploratory runs without calibration.
+  allow_default_intrinsics: false
 
 ingest:
+  # Frame window for video sources (start_frame + max_frames + stride bound the decode work).
   source_type: "zurich"
   start_frame: 0
   max_frames: 300
@@ -20,8 +27,18 @@ ingest:
 keyframes:
   strategy: "laplacian_variance"
   stride: 2
+  # Selection cap: candidates are uniformly subsampled across the whole slice, never truncated.
   max_frames: 250
+  # Blur score = variance of the Laplacian on the grayscale frame resized to 640 px width
+  # (recorded per frame as analysis_width_px in keyframes.json).
+  #
+  # min_blur is imagery- and resolution-dependent: 60.0 was calibrated on the synthetic sample
+  # generator's frames, whose median is >800, so on real GoPro frames this gate may reject
+  # nothing. Either re-calibrate it against the target imagery, or use the adaptive mode below,
+  # which gates on the distribution observed in the run itself.
   min_blur: 60.0
+  min_blur_mode: "absolute"   # "absolute" (use min_blur) | "adaptive" (percentile of this run)
+  blur_percentile: 5.0
   max_clipping: 0.05
   max_gap: 15
   orb_features: 2000
@@ -44,5 +61,8 @@ sync:
   strategy: "nearest"
 
 validation:
+  # KPI thresholds used by the CLI summary and SP1_REPORT.md.
   alignment: "sim3"
   ate_threshold_meters: 5.0
+  min_registration_rate: 0.85
+  max_reprojection_error_px: 1.5
