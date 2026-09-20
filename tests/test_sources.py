@@ -227,6 +227,7 @@ class TestRealZurichTelemetryFormat:
         assert records[0].timestamp_us == 1459425600000000
         assert records[1].timestamp_us - records[0].timestamp_us == 200000
         # Traceability of the applied normalisation
+        assert records[0].raw_fields["_timestamp_unit_detected"] == "milliseconds"
         assert records[0].raw_fields["_lat_scale"] == "1/1e+07"
         assert records[0].raw_fields["_alt_scale"] == "1/1e+03"
 

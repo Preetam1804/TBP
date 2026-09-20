@@ -153,6 +153,14 @@ class ZurichSequenceSource(ImageSource):
         if self.gt_file and self.gt_file.exists():
             self._gt_records, _ = parse_ground_truth_agl(self.gt_file)
 
+        # 2b. Log the resolved dataset layout so a wrong auto-detection is immediately visible.
+        logger.info(
+            f"Dataset layout: images={self.images_dir.name}, gps="
+            f"{self.gps_file.name if self.gps_file else 'none'}, ground_truth="
+            f"{self.gt_file.name if self.gt_file else 'none'}, calibration="
+            f"{self.calib_file.name if self.calib_file else 'none'}"
+        )
+
         # 3. Discover and numerically sort all available images
         self._all_image_ids, self._image_paths = self._discover_images()
 
@@ -184,10 +192,20 @@ class ZurichSequenceSource(ImageSource):
                 break
 
         if images_dir is None:
-            # Check if any subfolder contains images
-            subfolders_with_jpg = [d for d in self.dataset_dir.iterdir() if d.is_dir() and any(d.glob("*.jp*g"))]
+            # Fallback: any subfolder holding images, chosen deterministically (name order) and
+            # logged, so the same dataset always resolves to the same frame set.
+            subfolders_with_jpg = sorted(
+                (d for d in self.dataset_dir.iterdir() if d.is_dir() and any(d.glob("*.jp*g"))),
+                key=lambda d: d.name,
+            )
             if subfolders_with_jpg:
                 images_dir = subfolders_with_jpg[0].resolve()
+                if len(subfolders_with_jpg) > 1:
+                    logger.warning(
+                        f"Multiple image folders found in {self.dataset_dir} "
+                        f"({[d.name for d in subfolders_with_jpg]}); using '{images_dir.name}' "
+                        "(first in name order)"
+                    )
             else:
                 missing_components.append("Images folder (e.g. 'MAV Images/' or '*.jpg' files)")
 
@@ -241,21 +259,43 @@ class ZurichSequenceSource(ImageSource):
         return images_dir, gps_file, gt_file, calib_file
 
     def _discover_images(self) -> tuple[list[int], dict[int, Path]]:
-        """Discover image files and sort them numerically by numeric ID."""
+        """Discover image files, keyed by numeric id, failing loudly on duplicate ids.
+
+        Two files resolving to the same numeric id (e.g. ``frame_000012.jpg`` next to
+        ``zurich_000012.jpg``, or a synthetic set generated on top of a real one) would silently
+        drop one frame and pair the other with the wrong telemetry row, so it is an error.
+        """
         pattern = re.compile(r"(\d+)")
         image_map: dict[int, Path] = {}
+        seen_paths: set[Path] = set()
 
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"):
-            for img_path in self.images_dir.glob(ext):
+            for img_path in sorted(self.images_dir.glob(ext)):
+                resolved = img_path.resolve()
+                if resolved in seen_paths:
+                    continue  # same file matched by more than one extension pattern
+                seen_paths.add(resolved)
+
                 match = pattern.findall(img_path.stem)
-                if match:
-                    numeric_id = int(match[-1])
-                    image_map[numeric_id] = img_path.resolve()
+                if not match:
+                    continue
+                numeric_id = int(match[-1])
+                if numeric_id in image_map:
+                    raise DataError(
+                        f"Duplicate numeric image id {numeric_id} in {self.images_dir}: "
+                        f"'{image_map[numeric_id].name}' and '{img_path.name}'. "
+                        "Frame ids must be unique; remove the duplicate or use a clean dataset directory."
+                    )
+                image_map[numeric_id] = resolved
 
         if not image_map:
             raise DataError(f"No numeric image files found in {self.images_dir}")
 
         sorted_ids = sorted(image_map.keys())
+        logger.info(
+            f"Image layout: {len(sorted_ids)} frames in {self.images_dir} "
+            f"(ids {sorted_ids[0]}..{sorted_ids[-1]})"
+        )
         return sorted_ids, image_map
 
     def _select_subset(self) -> list[int]:

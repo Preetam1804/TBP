@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "pycolmap==3.12.*",
-    "opencv-python==4.10.*",
+    # Headless build: the pipeline only needs codecs/processing, and opencv-python requires
+    # libGL.so.1 on servers/CI images (see README).
+    "opencv-python-headless==4.10.*",
     "numpy",
     "scipy",
     "pydantic>=2",

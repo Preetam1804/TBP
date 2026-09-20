@@ -83,7 +83,8 @@ def normalize_timestamp_us(raw_value: float) -> tuple[int, str]:
         tuple of (timestamp_us, human-readable description of the detected unit).
     """
     # Candidates are (multiplier_to_microseconds, unit_label), ordered so that the most common
-    # PX4/GoPro encodings win when several interpretations are epoch-plausible.
+    # encodings win when several interpretations are epoch-plausible:
+    # microseconds x1, milliseconds x1e3, nanoseconds x1e-3, seconds x1e6.
     for scale, label in ((1.0, "microseconds"), (1e3, "milliseconds"), (1e-3, "nanoseconds"), (1e6, "seconds")):
         candidate = raw_value * scale
         if _EPOCH_MIN_US <= candidate <= _EPOCH_MAX_US:

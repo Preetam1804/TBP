@@ -1,6 +1,7 @@
 """Command-line interface for the uav3d pipeline."""
 
 import argparse
+import logging
 import os
 import sys
 from collections.abc import Sequence
@@ -21,7 +22,7 @@ from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
 from uav3d.sfm import SfmRunner, export_poses
 from uav3d.sources.base import ImageSource
-from uav3d.sources.video import VideoFileSource
+from uav3d.sources.video import DEFAULT_FOCAL_RATIO, VideoFileSource
 from uav3d.sources.zurich import ZurichSequenceSource
 from uav3d.telemetry import TelemetrySynchronizer
 from uav3d.validation import (
@@ -124,6 +125,38 @@ def _resolve_dataset_dir(cfg: PipelineConfig, data_dir: Path, args: argparse.Nam
         if candidate.exists():
             return candidate.resolve()
     return candidates[0].resolve()
+
+
+def _latest_run_dir(outputs_dir: Path, stage: str, required_artifacts: tuple[str, ...]) -> Path:
+    """Return the most recent run directory that actually contains the required artifacts.
+
+    Selection is by modification time (the timestamp embedded in the run name is only used to
+    break ties), so a run copied in later - or a clock skew between hosts - cannot make an
+    unrelated/stale run the target of sync or validation.
+    """
+    if not outputs_dir.exists():
+        raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d {stage}' first.")
+
+    candidates = [
+        d
+        for d in outputs_dir.iterdir()
+        if d.is_dir() and d.name.startswith("run_") and all((d / name).exists() for name in required_artifacts)
+    ]
+    if not candidates:
+        found = sorted(d.name for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_"))
+        raise Uav3dError(
+            f"No run directory in {outputs_dir} contains {', '.join(required_artifacts)}. "
+            f"Found run directories: {found or 'none'}. Run 'uav3d {stage}' first, or pass --run-dir."
+        )
+
+    candidates.sort(key=lambda p: (p.stat().st_mtime, p.name))
+    chosen = candidates[-1]
+    if len(candidates) > 1:
+        logging.getLogger("uav3d.cli").info(
+            f"Auto-selected run directory {chosen.name} (latest of {len(candidates)} runs containing "
+            f"{', '.join(required_artifacts)}); use --run-dir to override"
+        )
+    return chosen
 
 
 def _resolve_manifest_path(args: argparse.Namespace, video_path: str | Path | None) -> Path | None:
@@ -272,6 +305,11 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         table.add_row("Initial Stride", str(summary.initial_stride))
         table.add_row("Final Stride", f"{summary.final_stride} (reductions: {summary.stride_reductions})")
         table.add_row(
+            "Blur Gate",
+            f"{summary.min_blur_mode} = {summary.effective_min_blur:.1f} "
+            f"(rejected {summary.rejected_by_blur}, clipping {summary.rejected_by_clipping})",
+        )
+        table.add_row(
             "Blur Score (med / p95)",
             f"{summary.blur_dist.median_val:.1f} / {summary.blur_dist.p95_val:.1f} (min: {summary.blur_dist.min_val:.1f})",
         )
@@ -302,16 +340,7 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         if getattr(args, "run_dir", None):
             run_dir = Path(args.run_dir).resolve()
         else:
-            outputs_dir = Path(data_dir) / "outputs"
-            if not outputs_dir.exists():
-                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d keyframes' first.")
-            run_dirs = sorted(
-                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
-                key=lambda p: p.name,
-            )
-            if not run_dirs:
-                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d keyframes' first.")
-            run_dir = run_dirs[-1]
+            run_dir = _latest_run_dir(Path(data_dir) / "outputs", "keyframes", ("keyframes.json",))
 
         logger.info(f"Target SfM run directory: {run_dir}")
         images_dir = run_dir / "sfm" / "images"
@@ -348,7 +377,7 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
             w = actual_width or 1920
             h = actual_height or 1080
-            fx = fy = float(w) * 0.9
+            fx = fy = float(w) * DEFAULT_FOCAL_RATIO
             cx = float(w) / 2.0
             cy = float(h) / 2.0
             calibration = CameraCalibration(
@@ -359,10 +388,13 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
                 source=f"auto_video_{w}x{h}",
             )
             cfg.sfm.camera_model = "PINHOLE"
+            # A focal length derived from the frame width is a guess, so it must be refined by
+            # bundle adjustment; the run records that intrinsics were NOT locked.
             cfg.sfm.refine_intrinsics = True
             logger.info(
                 f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
-                f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
+                f"fx=fy={fx:.1f} (focal ratio {DEFAULT_FOCAL_RATIO}), cx={cx:.1f}, cy={cy:.1f}; "
+                f"refine_intrinsics={cfg.sfm.refine_intrinsics}"
             )
         else:
             source = _build_source(cfg, data_dir, args)
@@ -427,14 +459,23 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
 
         console.print(table)
 
-        if result.registration_rate < 0.85:
+        reg_target = cfg.validation.min_registration_rate
+        reproj_target = cfg.validation.max_reprojection_error_px
+        if result.registration_rate < reg_target:
             console.print(
-                "[yellow]Warning: Registration rate below 85% KPI. Consider increasing sequential overlap or adjusting keyframe stride.[/yellow]"
+                f"[yellow]Warning: Registration rate {result.registration_rate * 100:.1f}% is below the "
+                f"{reg_target * 100:.1f}% KPI. Consider increasing sequential overlap or adjusting keyframe stride.[/yellow]"
+            )
+        elif result.mean_reprojection_error_px > reproj_target:
+            console.print(
+                f"[yellow]Warning: Mean reprojection error {result.mean_reprojection_error_px:.3f} px exceeds the "
+                f"{reproj_target:.3f} px KPI.[/yellow]"
             )
         else:
             console.print(
-                f"[bold green]SfM Quality Gate Passed:[/bold green] Registration {result.registration_rate*100:.1f}% >= 85%, "
-                f"Reprojection Error {result.mean_reprojection_error_px:.3f} px <= 1.5 px."
+                f"[bold green]SfM Quality Gate Passed:[/bold green] Registration {result.registration_rate * 100:.1f}% "
+                f">= {reg_target * 100:.1f}%, Reprojection Error {result.mean_reprojection_error_px:.3f} px "
+                f"<= {reproj_target:.3f} px."
             )
 
     return 0
@@ -451,16 +492,7 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
         if getattr(args, "run_dir", None):
             run_dir = Path(args.run_dir).resolve()
         else:
-            outputs_dir = Path(data_dir) / "outputs"
-            if not outputs_dir.exists():
-                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
-            run_dirs = sorted(
-                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
-                key=lambda p: p.name,
-            )
-            if not run_dirs:
-                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
-            run_dir = run_dirs[-1]
+            run_dir = _latest_run_dir(Path(data_dir) / "outputs", "sfm", ("poses.json",))
 
         logger.info(f"Target Sync run directory: {run_dir}")
         poses_path = run_dir / "poses.json"
@@ -552,16 +584,7 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         if args.run_dir:
             run_dir = Path(args.run_dir).resolve()
         else:
-            outputs_dir = Path(data_dir) / "outputs"
-            if not outputs_dir.exists():
-                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
-            run_dirs = sorted(
-                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
-                key=lambda p: p.name,
-            )
-            if not run_dirs:
-                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
-            run_dir = run_dirs[-1]
+            run_dir = _latest_run_dir(Path(data_dir) / "outputs", "sfm", ("poses.json",))
 
         logger.info(f"Target validation run directory: {run_dir}")
         poses_path = run_dir / "poses.json"
@@ -650,6 +673,8 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         table.add_column("Value", style="green")
 
         m = ate_report.metrics
+        reg_target = cfg.validation.min_registration_rate
+        reproj_target = cfg.validation.max_reprojection_error_px
         table.add_row("Run Directory", str(run_dir))
         table.add_row("Dataset Provenance", ate_report.dataset_label)
         table.add_row("Matched Frames (SfM & GT)", f"{m.num_matched_frames} / {m.num_registered_frames}")
@@ -662,13 +687,25 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         table.add_row("ATE Max Error", f"{m.max_m:.4f} m")
 
         if m.registration_rate is not None:
-            reg_style = "bold green" if m.registration_rate >= 0.85 else "bold red"
-            table.add_row("Registration Rate (KPI >= 85%)", f"[{reg_style}]{m.registration_rate * 100:.1f}%[/{reg_style}]")
+            reg_style = "bold green" if m.registration_rate >= reg_target else "bold red"
+            table.add_row(
+                f"Registration Rate (KPI >= {reg_target * 100:.0f}%)",
+                f"[{reg_style}]{m.registration_rate * 100:.1f}%[/{reg_style}]",
+            )
 
         if m.mean_reprojection_error_px is not None:
-            reproj_style = "bold green" if m.mean_reprojection_error_px <= 1.5 else "bold red"
-            table.add_row("Reprojection Error (KPI <= 1.5px)", f"[{reproj_style}]{m.mean_reprojection_error_px:.3f} px[/{reproj_style}]")
+            reproj_style = "bold green" if m.mean_reprojection_error_px <= reproj_target else "bold red"
+            table.add_row(
+                f"Reprojection Error (KPI <= {reproj_target:g}px)",
+                f"[{reproj_style}]{m.mean_reprojection_error_px:.3f} px[/{reproj_style}]",
+            )
 
+        ate_target = cfg.validation.ate_threshold_meters
+        ate_style = "bold green" if m.rmse_m <= ate_target else "bold red"
+        table.add_row(
+            f"ATE KPI (<= {ate_target:g} m)",
+            f"[{ate_style}]{'PASSED' if m.rmse_m <= ate_target else 'FAILED'}[/{ate_style}]",
+        )
         table.add_row("Validation Status", f"[bold green]{ate_report.status.upper()}[/bold green]")
         table.add_row("Report Artifacts", f"ate_report.json, SP1_REPORT.md, {', '.join(plots.values())}")
 

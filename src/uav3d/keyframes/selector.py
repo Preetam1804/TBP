@@ -14,7 +14,7 @@ from uav3d.config import KeyframeConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.quality import FrameQualityMetrics, compute_frame_quality
 from uav3d.models.frames import FrameRecord
-from uav3d.models.keyframes import KeyframeRecord, KeyframesFile
+from uav3d.models.keyframes import KeyframeRecord, KeyframeSelectionMeta, KeyframesFile
 from uav3d.sources.base import ImageSource
 
 logger = logging.getLogger("uav3d.keyframes.selector")
@@ -286,7 +286,9 @@ class KeyframeSelector:
         # 4. Cap at max_frames by uniform subsampling.
         # Truncating the tail would silently cover only the beginning of the flight and hand
         # SfM/ATE a partial trajectory while still reporting a full-run KPI.
+        cap_applied_by_subsampling = False
         if len(selected_records) > self.max_frames:
+            cap_applied_by_subsampling = True
             keep = np.linspace(0, len(selected_records) - 1, self.max_frames).round().astype(int)
             keep = np.unique(keep)  # defensive: guarantee strictly increasing, unique source indices
             logger.info(
@@ -305,6 +307,21 @@ class KeyframeSelector:
         keyframes_file = KeyframesFile(
             schema_version="1.0.0",
             dataset_label=dataset_label,
+            selection=KeyframeSelectionMeta(
+                considered_count=total_frames,
+                selected_count=len(selected_records),
+                initial_stride=self.initial_stride,
+                final_stride=current_stride,
+                min_blur_mode=self.min_blur_mode,
+                effective_min_blur=round(float(effective_min_blur), 4),
+                max_clipping=float(self.max_clipping),
+                max_gap=int(self.max_gap),
+                rejected_by_blur=rejected_blur,
+                rejected_by_clipping=rejected_clipping,
+                decode_failed_count=decode_failed_count,
+                max_frames=int(self.max_frames),
+                cap_applied_by_subsampling=cap_applied_by_subsampling,
+            ),
             keyframes=selected_records,
         )
         json_path = run_dir / "keyframes.json"

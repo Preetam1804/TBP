@@ -1,5 +1,11 @@
-"""Generate realistic 3D synthetic aerial sample dataset for Zurich Urban MAV."""
+"""Generate a realistic 3D synthetic aerial sample dataset for the Zurich Urban MAV layout.
 
+The default output directory is deliberately *not* the path the baseline config reads for the
+real dataset (``data/raw/zurich_mav``): writing synthetic frames into a real dataset directory
+would silently mix 50 synthetic frames into the real image set and overwrite its calibration.
+"""
+
+import argparse
 import logging
 from pathlib import Path
 
@@ -9,18 +15,58 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("generate_sample_zurich")
 
+DEFAULT_DATASET_DIR = "data/synthetic/zurich_mav"
+
+
+class DatasetPathError(RuntimeError):
+    """Raised when the requested output directory would clobber existing data."""
+
+
+def _ensure_writable_output_dir(base: Path, force: bool) -> None:
+    """Refuse to write into a directory that already holds dataset content, unless forced."""
+    if not base.exists():
+        return
+
+    existing_entries = [p for p in base.iterdir() if p.name not in {".gitkeep"}]
+    if not existing_entries:
+        return
+
+    looks_like_real_dataset = any(
+        entry.name == "calibration_data.npz" or entry.name == "MAV Images" or entry.name == "Log Files"
+        for entry in existing_entries
+    )
+    if force:
+        logger.warning(f"--force: overwriting existing content in {base}")
+        return
+
+    detail = " (this looks like a real Zurich dataset directory)" if looks_like_real_dataset else ""
+    raise DatasetPathError(
+        f"Refusing to write synthetic data into non-empty directory {base}{detail}. "
+        "Choose an empty --dataset-dir (e.g. data/synthetic/zurich_mav), or pass --force to overwrite."
+    )
+
 
 def generate_zurich_sample_dataset(
-    dataset_dir: str | Path = "data/raw/zurich_mav",
+    dataset_dir: str | Path = DEFAULT_DATASET_DIR,
     num_frames: int = 50,
+    force: bool = False,
+    overwrite_calibration: bool = False,
 ) -> None:
-    """Populate data/raw/zurich_mav with 50 frames observing a true 3D scene.
+    """Populate ``dataset_dir`` with ``num_frames`` frames observing a true 3D scene.
 
     Ensures that visual SfM (pycolmap) can extract consistent SIFT features,
     triangulate 3D points, lock known intrinsics, and estimate camera poses
     matching the GroundTruthAGL and GPS trajectory.
+
+    Args:
+        dataset_dir: Output directory (default ``data/synthetic/zurich_mav``).
+        num_frames: Number of frames to render.
+        force: Allow writing into a non-empty/real dataset directory.
+        overwrite_calibration: Allow replacing an existing ``calibration_data.npz``.
     """
     base = Path(dataset_dir).resolve()
+    _ensure_writable_output_dir(base, force)
+
     img_dir = base / "MAV Images"
     log_dir = base / "Log Files"
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -33,8 +79,14 @@ def generate_zurich_sample_dataset(
     K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
     dist = np.array([-0.05, 0.01, 0.0, 0.0], dtype=np.float64)
 
-    # Save calibration_data.npz
-    np.savez(str(base / "calibration_data.npz"), camera_matrix=K, distortion_coefficients=dist)
+    # Save calibration_data.npz — never silently replace a real dataset calibration.
+    calib_path = base / "calibration_data.npz"
+    if calib_path.exists() and not overwrite_calibration:
+        raise DatasetPathError(
+            f"{calib_path} already exists. Refusing to overwrite an existing calibration file; "
+            "pass --overwrite-calibration if you really mean to regenerate the synthetic one."
+        )
+    np.savez(str(calib_path), camera_matrix=K, distortion_coefficients=dist)
     logger.info(f"Saved calibration_data.npz to {base}")
 
     # Generate persistent 3D world scene along flight path
@@ -136,5 +188,31 @@ def generate_zurich_sample_dataset(
     logger.info(f"Generated {gt_path}")
 
 
+def main() -> int:
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("dataset_dir", nargs="?", default=DEFAULT_DATASET_DIR, help=f"Output directory (default: {DEFAULT_DATASET_DIR})")
+    parser.add_argument("--num-frames", type=int, default=50, help="Number of frames to render (default: 50)")
+    parser.add_argument("--force", action="store_true", help="Allow writing into a non-empty directory")
+    parser.add_argument(
+        "--overwrite-calibration",
+        action="store_true",
+        help="Allow replacing an existing calibration_data.npz",
+    )
+    args = parser.parse_args()
+
+    try:
+        generate_zurich_sample_dataset(
+            dataset_dir=args.dataset_dir,
+            num_frames=args.num_frames,
+            force=args.force,
+            overwrite_calibration=args.overwrite_calibration,
+        )
+    except DatasetPathError as exc:
+        logger.error(str(exc))
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    generate_zurich_sample_dataset()
+    raise SystemExit(main())

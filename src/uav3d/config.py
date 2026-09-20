@@ -136,6 +136,17 @@ class ValidationConfig(BaseModel):
         gt=0.0,
         description="Absolute Trajectory Error RMSE warning threshold in metres (reported as PASS/FAIL)",
     )
+    min_registration_rate: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description="SfM registration-rate KPI target used in SP1_REPORT.md",
+    )
+    max_reprojection_error_px: float = Field(
+        default=1.5,
+        gt=0.0,
+        description="Mean reprojection-error KPI target (pixels) used in SP1_REPORT.md",
+    )
 
 
 class SourceConfig(BaseModel):
