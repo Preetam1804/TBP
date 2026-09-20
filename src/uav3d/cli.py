@@ -575,8 +575,10 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
             if not gt_file.is_file():
                 raise Uav3dError(f"Ground truth file not found: {gt_file}")
         else:
+            # Ground truth must belong to the same run/provenance: a video run must not be
+            # silently validated against the Zurich dataset's GT (or vice versa).
             dataset_dir = _resolve_dataset_dir(cfg, Path(data_dir), args)
-            candidates = [
+            dataset_candidates = [
                 dataset_dir / "Log Files" / "GroundTruthAGL.csv",
                 dataset_dir / "GroundTruthAGL.csv",
                 *dataset_dir.glob("**/Log Files/GroundTruthAGL.csv"),
@@ -584,9 +586,28 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
                 Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
                 Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
             ]
+
+            video_arg = getattr(args, "video", None)
+            if video_arg is None and cfg.source.type.lower() == "video":
+                video_arg = cfg.source.video_path
+            video_candidates: list[Path] = []
+            if video_arg:
+                video_dir = Path(str(video_arg)).expanduser()
+                video_dir = (Path.cwd() / video_dir).resolve().parent if not video_dir.is_absolute() else video_dir.resolve().parent
+                video_candidates = [
+                    video_dir / "ground_truth_agl.csv",
+                    video_dir / "GroundTruthAGL.csv",
+                ]
+
+            is_video_run = bool(video_candidates) or any(
+                p.frame_id.startswith("video_") for p in poses_file.poses
+            )
+            candidates = video_candidates + dataset_candidates if is_video_run else dataset_candidates
+
             for c in candidates:
                 if c.is_file():
                     gt_file = c.resolve()
+                    logger.info(f"Selected ground truth file ({'video' if is_video_run else 'dataset'} run): {gt_file}")
                     break
 
         if gt_file is None or not gt_file.exists():

@@ -56,5 +56,5 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"scripts/*" = ["E402"]  # scratch/dataset scripts adjust sys.path before importing uav3d
+"scripts/*" = ["E402", "RUF100"]  # scratch/dataset scripts adjust sys.path before importing uav3d
 "tests/*" = ["B011"]
