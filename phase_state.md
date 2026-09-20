@@ -66,9 +66,10 @@ uav3d inspect --config configs/zurich_baseline.yaml
 ### Database Changes
 None (no DB in SP-1).
 ### Tests and Validation
-pytest: 33 passed.
-Real-data inspect summary:
-- Source: zurich_urban_mav_zurich_mav (50 frames in slice, 1920x1080)
+pytest: 33 passed (81 after the 2026-09-20 fix pass).
+Synthetic-sample inspect summary (scripts/generate_sample_zurich.py — the real AGZ dataset is not
+stored in this repository; see the provenance note at the end of this file):
+- Source: zurich_mav (50 frames in slice, 1920x1080)
 - Frame range: zurich_000000 to zurich_000049
 - Timestamp range: 1,459,425,600,000,000 µs to 1,459,425,609,600,000 µs
 - Camera model: OPENCV (source: calibration_data.npz), params: [1060.0, 1060.0, 960.0, 540.0, -0.05, 0.01, 0.0, 0.0]
@@ -92,8 +93,12 @@ cli.py, config.py, configs/zurich_baseline.yaml
 ### Decisions Made
 No optical-flow selection (deferred); min_blur=60.0 after inspecting metric distribution;
 symlink with copy fallback; overlap guard halves stride automatically.
-### Real-data Results
-considered=50, selected=25, final stride=2, blur median/p95=422.6/428.5 (min: 409.3), ORB features median/p95=172/178, clipping median/p95=0.28%/0.28%
+### Synthetic-sample Results (generator, not the real AGZ imagery)
+Post-fix re-run (2026-09-20): considered=50, selected=25, final stride=2,
+blur median/p95=843.7/1031.9 (min: 388.4), ORB features median/p95=1714/1785 (min: 1150),
+clipping median/p95=0.12%/0.17%, blur gate absolute=60.0 rejected 0/50.
+The gate rejects nothing on this imagery, which is exactly why `min_blur` is documented in
+`configs/zurich_baseline.yaml` as needing re-calibration (or `min_blur_mode: adaptive`) on real frames.
 ### Remaining Tasks
 Phase 3 SfM.
 ### Current Blockers
@@ -109,8 +114,8 @@ poses.json exporter with metrics; 'uav3d sfm' CLI; real-data run.
 sfm/{runner,colmap_export,colmap_compat,__init__}.py, scripts/scratch_pycolmap_check.py, tests/test_sfm_export.py
 ### Decisions Made
 pycolmap 3.12.6; cam_from_world API = confirmed modern Image.cam_from_world() method returning Rigid3d, with Rotation3d.quat in Eigen [x, y, z, w] format mapped to [qw, qx, qy, qz] (wxyz) order via compat shim (supporting legacy qvec/tvec as fallback); intrinsics locked via database camera injection + IncrementalPipelineOptions BA refinement flags (ba_refine_focal_length=False, ba_refine_principal_point=False, ba_refine_extra_params=False, abs_pose_refine_*=False) and verified identical post-BA ([1060.0, 1060.0, 960.0, 540.0, -0.05, 0.01, 0.0, 0.0]); seq_overlap=10; max_image_size=1600.
-### Real-data Results
-models=1, registered=25/25 (100.0%), mean reproj err=0.588 px, runtime=19.25s, peak RSS=6486.5 MB
+### Synthetic-sample Results (generator, not the real AGZ imagery)
+models=1, registered=25/25 (100.0%), mean reproj err=0.588 px, 5398 points3D, runtime=19.25s, peak RSS=6486.5 MB
 ### Remaining Tasks
 Phase 4 telemetry sync.
 ### Current Blockers
@@ -127,8 +132,10 @@ telemetry/synchronizer.py, tests/test_telemetry.py
 ### Decisions Made
 Mode A only for Zurich (no offset estimation); 80% match threshold for Mode B status;
 poses.json untouched; recommended_crs via pyproj.
-### Real-data Results
-matched=25/25, sync_status=dataset_image_id_mapping, GPS range lat/lon=lat [47.376900, 47.377620], lon [8.541700, 8.542564], alt [450.00, 454.80] m
+### Synthetic-sample Results (generator, not the real AGZ imagery)
+matched=25/25, sync_status=dataset_image_id_mapping, offset_estimation=not_applicable,
+GPS ranges lat [47.376900, 47.377620], lon [8.541700, 8.542564], alt [450.00, 454.80] m,
+CRS recommendation: UTM zone 32N (EPSG:32632), local-ENU alternative centered at (47.377260, 8.542132)
 ### Remaining Tasks
 Phase 5 ATE validation.
 ### Current Blockers
@@ -142,10 +149,12 @@ Umeyama ATE validator with condition guard; reports (JSON, plots, SP1_REPORT.md)
 'uav3d validate' CLI; real-data validation run.
 ### Files Created
 validation/{ate,reports,__init__}.py, models/validation.py, tests/test_ate.py
-### Real-data Results (KPI vs target)
-registration=100.0% (target ≥85%); mean reproj=0.588px (target ≤1.5);
-ATE RMSE=1.2564m / median=1.1499m / p95=2.3486m; scale=7.6738; fit_condition=weak_flightline_geometry;
-matched=25/25; data label: replayed public dataset (Zurich Urban MAV) — not field-flight validation.
+### Synthetic-sample Results (generator, not the real AGZ imagery)
+Post-fix re-run (2026-09-20): registration=100.0% (target ≥85%, from validation.min_registration_rate);
+mean reproj=0.588px (target ≤1.5px, from validation.max_reprojection_error_px);
+ATE RMSE=1.2563m / median=1.1496m / p95=2.3485m / max=2.5040m; scale=7.6741;
+fit_condition=weak_flightline_geometry; matched=25/25; ATE KPI (≤5m, from validation.ate_threshold_meters)=PASSED;
+data label: replayed public dataset (Zurich Urban MAV) — not field-flight validation.
 ### Known Limitations
 rolling shutter uncorrected; GPS multipath; stride-based keyframing only.
 ### Remaining Tasks
@@ -154,3 +163,25 @@ SP-2 handoff: depth (SP-2 consumes poses.json + keyframes.json).
 <none>
 ### Next Actions
 Bug-fix buffer / capture-guidance notes; then SP-2 Phase A (DepthAnything-V2-Small).
+
+---
+
+## Provenance Note (2026-09-20)
+
+Every quantitative result recorded in Phases 1–5 above was measured on frames produced by
+`scripts/generate_sample_zurich.py` (50 synthetic frames laid out in the AGZ directory structure),
+not on the real Zurich Urban MAV dataset, which is evaluation-only and is not stored in this
+repository (28 GB; the 200 MB subset is at download.ifi.uzh.ch/rpg/AGZ_data/AGZ_subset.zip).
+The earlier "Real-data Results" headings were inaccurate and have been relabelled. Numbers that
+predated the telemetry unit fix were also refreshed from a post-fix run.
+
+Reproduce the synthetic run with:
+
+```bash
+python scripts/generate_sample_zurich.py data/synthetic/zurich_mav   # refuses non-empty dirs
+python -m uav3d.cli inspect|keyframes|sfm|sync|validate --config configs/zurich_baseline.yaml \
+    --dataset-dir data/synthetic/zurich_mav --data-dir data
+```
+
+Before quoting these KPIs as field validation, re-run the same commands against the real AGZ
+frames (set `source.dataset_dir` and re-calibrate `keyframes.min_blur` for real imagery).

@@ -1,6 +1,7 @@
 """Tests for keyframe quality metrics, deterministic selection, overlap guard, and CLI."""
 
 import json
+import re
 from pathlib import Path
 
 import cv2
@@ -185,26 +186,64 @@ class TestCliKeyframesCommand:
         assert exit_code == 0
 
     def test_keyframe_selection_from_video(self, tmp_path: Path) -> None:
-        """Verify that KeyframeSelector extracts and saves best frames from an MP4 video."""
+        """Verify that KeyframeSelector extracts and saves the best frames from an MP4 video.
+
+        Fully hermetic: renders a textured, camera-moving clip so the quality gate
+        and the frame-accurate extraction path are both exercised.
+        """
         from uav3d.sources.video import VideoFileSource
 
-        video_path = Path("data/interim/synthetic.mp4")
-        if not video_path.exists():
-            pytest.skip("synthetic.mp4 not found")
+        video_path = tmp_path / "textured_clip.mp4"
+        width, height, fps, num_frames = 320, 240, 10.0, 12
+        writer = cv2.VideoWriter(
+            str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
+        )
+        assert writer.isOpened()
+        for i in range(num_frames):
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            frame[:, :] = 90
+            offset = i * 3
+            for x in range(0, width, 16):
+                for y in range(0, height, 16):
+                    if ((x // 16) + (y // 16)) % 2 == 0:
+                        frame[y : y + 16, x : x + 16] = 220
+            frame = np.roll(frame, offset, axis=1)
+            cv2.putText(
+                frame, f"F{i:02d}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (10, 10, 10), 2, cv2.LINE_AA
+            )
+            writer.write(frame)
+        writer.release()
 
         source = VideoFileSource(video_path=video_path)
         selector = KeyframeSelector(
             KeyframeConfig(
-                stride=10,
+                stride=2,
                 min_blur=10.0,
                 max_clipping=0.5,
                 max_gap=20,
             )
         )
-        res = selector.select(source, output_dir=tmp_path)
+        res = selector.select(source, output_dir=tmp_path / "run_video")
         assert res.selected_count > 0
+        assert res.selected_count == num_frames // 2
         assert res.keyframes_json_path.exists()
-        extracted_images = list((tmp_path / "sfm" / "images").glob("*.jpg"))
+        images_dir = tmp_path / "run_video" / "sfm" / "images"
+        extracted_images = sorted(images_dir.glob("*.jpg"))
         assert len(extracted_images) == res.selected_count
         assert all(img.stat().st_size > 1000 for img in extracted_images)
+
+        # Each saved keyframe must be the correct source frame index (not just any frame).
+        parsed = KeyframesFile.model_validate_json(res.keyframes_json_path.read_text(encoding="utf-8"))
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            for rec in parsed.keyframes:
+                saved = cv2.imread(str(images_dir / f"{rec.frame_id}.jpg"))
+                assert saved is not None
+                idx = int(re.search(r"(\d+)$", rec.frame_id).group(1))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, expected = cap.read()
+                assert ok
+                assert np.abs(saved.astype(np.int16) - expected.astype(np.int16)).mean() < 5.0
+        finally:
+            cap.release()
 

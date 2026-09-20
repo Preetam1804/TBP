@@ -18,6 +18,10 @@ class FrameQualityMetrics:
     brightness_mean: float
     clipping_ratio: float
     feature_count: int
+    # Normalisation of the above metrics: they are computed on a grayscale frame resized to
+    # `analysis_width_px` width, so absolute thresholds are only comparable at equal width.
+    analysis_width_px: int
+    analysis_height_px: int
 
     def to_dict(self) -> dict[str, float]:
         """Convert metrics to float dictionary."""
@@ -92,4 +96,6 @@ def compute_frame_quality(
         brightness_mean=brightness_mean,
         clipping_ratio=clipping_ratio,
         feature_count=feature_count,
+        analysis_width_px=int(gray_small.shape[1]),
+        analysis_height_px=int(gray_small.shape[0]),
     )

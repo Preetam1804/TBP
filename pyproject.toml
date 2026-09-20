@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "pycolmap==3.12.*",
-    "opencv-python==4.10.*",
+    # Headless build: the pipeline only needs codecs/processing, and opencv-python requires
+    # libGL.so.1 on servers/CI images (see README).
+    "opencv-python-headless==4.10.*",
     "numpy",
     "scipy",
     "pydantic>=2",
@@ -34,3 +36,27 @@ uav3d = "uav3d.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:uav3d.*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [".venv", "data", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",   # line length is enforced by the formatter
+    "B008",   # function calls in argument defaults are used deliberately (pydantic Field)
+    "RUF001", # en-dashes/micro signs in prose strings are intentional
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E402", "RUF100"]  # scratch/dataset scripts adjust sys.path before importing uav3d
+"tests/*" = ["B011"]

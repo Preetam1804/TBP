@@ -1,6 +1,7 @@
 """Command-line interface for the uav3d pipeline."""
 
 import argparse
+import logging
 import os
 import sys
 from collections.abc import Sequence
@@ -13,7 +14,7 @@ from rich.table import Table
 
 from uav3d import __version__
 from uav3d.config import PipelineConfig, load_config
-from uav3d.exceptions import Uav3dError
+from uav3d.exceptions import ConfigError, Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
 from uav3d.models.frames import CameraCalibration
@@ -21,7 +22,7 @@ from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
 from uav3d.sfm import SfmRunner, export_poses
 from uav3d.sources.base import ImageSource
-from uav3d.sources.video import VideoFileSource
+from uav3d.sources.video import DEFAULT_FOCAL_RATIO, VideoFileSource
 from uav3d.sources.zurich import ZurichSequenceSource
 from uav3d.telemetry import TelemetrySynchronizer
 from uav3d.validation import (
@@ -36,19 +37,34 @@ err_console = Console(stderr=True)
 SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate")
 
 
+DEFAULT_CONFIG_PATH = Path("configs") / "zurich_baseline.yaml"
+
+
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    """Attach standard --config, --data-dir, and --video flags to a subcommand parser."""
+    """Attach standard --config, --data-dir, --dataset-dir, and --video flags to a subcommand parser."""
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/zurich_baseline.yaml",
-        help="Path to YAML pipeline configuration file (default: configs/zurich_baseline.yaml)",
+        default=None,
+        help=(
+            "Path to YAML pipeline configuration file "
+            f"(default: {DEFAULT_CONFIG_PATH} when it exists, otherwise built-in defaults)"
+        ),
     )
     parser.add_argument(
         "--data-dir",
         type=str,
         default=None,
-        help="Data directory root (overrides config data_dir and UAV3D_DATA_DIR env var)",
+        help=(
+            "Data directory root for outputs (overrides config data_dir and UAV3D_DATA_DIR env var). "
+            "The dataset itself is located via source.dataset_dir, or --dataset-dir."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=str,
+        default=None,
+        help="Explicit dataset directory (overrides source.dataset_dir); use for external dataset roots",
     )
     parser.add_argument(
         "--video",
@@ -58,32 +74,142 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) -> ImageSource:
+def _load_pipeline_config(args: argparse.Namespace) -> PipelineConfig:
+    """Load the pipeline configuration, failing fast on an explicitly requested missing file.
+
+    A missing --config must never silently fall back to the packaged baseline: the run
+    would then use different parameters than the operator asked for.
+    """
+    requested = getattr(args, "config", None)
+    if requested:
+        path = Path(requested).expanduser()
+        if not path.is_file():
+            raise ConfigError(f"Configuration file not found: {path}")
+        return load_config(path)
+    if DEFAULT_CONFIG_PATH.is_file():
+        return load_config(DEFAULT_CONFIG_PATH)
+    return load_config(None)
+
+
+def _resolve_data_dir(args: argparse.Namespace, cfg: PipelineConfig) -> Path:
+    """Resolve the data directory used for outputs (absolute)."""
+    raw = getattr(args, "data_dir", None) or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+    return Path(raw).expanduser().resolve()
+
+
+def _resolve_dataset_dir(cfg: PipelineConfig, data_dir: Path, args: argparse.Namespace) -> Path:
+    """Resolve the Zurich dataset directory (absolute).
+
+    Precedence: --dataset-dir, then source.dataset_dir. A relative source.dataset_dir is
+    resolved against the working directory first and, as a fallback, against the data
+    directory (so `--data-dir /mnt/agz` finds `raw/zurich_mav`, `data/raw/zurich_mav`,
+    and `dataset_dir`-as-written layouts).
+    """
+    explicit = getattr(args, "dataset_dir", None)
+    if explicit:
+        path = Path(explicit).expanduser()
+        return path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
+
+    raw = Path(cfg.source.dataset_dir).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+
+    candidates = [
+        Path.cwd() / raw,  # documented layout: repo-root/data/raw/zurich_mav
+        data_dir / raw,  # dataset root mirrors the config layout
+        data_dir / raw.name,  # --data-dir points straight at the dataset folder
+        data_dir / "raw" / raw.name,  # --data-dir holds a raw/ folder
+        data_dir.parent / raw,  # legacy behaviour (data_dir/../data/raw/zurich_mav)
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _latest_run_dir(outputs_dir: Path, stage: str, required_artifacts: tuple[str, ...]) -> Path:
+    """Return the most recent run directory that actually contains the required artifacts.
+
+    Selection is by modification time (the timestamp embedded in the run name is only used to
+    break ties), so a run copied in later - or a clock skew between hosts - cannot make an
+    unrelated/stale run the target of sync or validation.
+    """
+    if not outputs_dir.exists():
+        raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d {stage}' first.")
+
+    candidates = [
+        d
+        for d in outputs_dir.iterdir()
+        if d.is_dir() and d.name.startswith("run_") and all((d / name).exists() for name in required_artifacts)
+    ]
+    if not candidates:
+        found = sorted(d.name for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_"))
+        raise Uav3dError(
+            f"No run directory in {outputs_dir} contains {', '.join(required_artifacts)}. "
+            f"Found run directories: {found or 'none'}. Run 'uav3d {stage}' first, or pass --run-dir."
+        )
+
+    candidates.sort(key=lambda p: (p.stat().st_mtime, p.name))
+    chosen = candidates[-1]
+    if len(candidates) > 1:
+        logging.getLogger("uav3d.cli").info(
+            f"Auto-selected run directory {chosen.name} (latest of {len(candidates)} runs containing "
+            f"{', '.join(required_artifacts)}); use --run-dir to override"
+        )
+    return chosen
+
+
+def _resolve_manifest_path(args: argparse.Namespace, video_path: str | Path | None) -> Path | None:
+    """Resolve the video frame manifest path: --manifest, else <video_dir>/manifest.json."""
+    explicit = getattr(args, "manifest", None)
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        if not path.is_file():
+            raise Uav3dError(f"Manifest file not found: {path}")
+        return path
+
+    if not video_path:
+        return None
+    candidate = Path(str(video_path)).expanduser().resolve().parent / "manifest.json"
+    return candidate if candidate.is_file() else None
+
+
+def _build_source(cfg: PipelineConfig, data_dir: Path, args: argparse.Namespace) -> ImageSource:
     """Build and initialize ImageSource adapter from configuration or CLI arguments."""
     video_cli = getattr(args, "video", None)
     if video_cli:
-        video_path = Path(video_cli).resolve()
+        video_path = Path(video_cli).expanduser().resolve()
         if not video_path.exists():
             raise Uav3dError(f"Specified video file does not exist: {video_path}")
-        return VideoFileSource(video_path=video_path)
+        return VideoFileSource(
+            video_path=video_path,
+            start_frame=cfg.ingest.start_frame,
+            max_frames=cfg.ingest.max_frames,
+        )
 
     source_type = cfg.source.type.lower()
     if source_type == "zurich":
-        dataset_path = Path(args.data_dir) if args.data_dir else Path(cfg.source.dataset_dir)
-        if not dataset_path.is_absolute():
-            dataset_path = (Path(data_dir).parent / dataset_path).resolve() if not dataset_path.exists() else dataset_path.resolve()
-
+        dataset_path = _resolve_dataset_dir(cfg, Path(data_dir), args)
         return ZurichSequenceSource(
             dataset_dir=dataset_path,
             start_id=cfg.source.start_id,
             count=cfg.source.count,
             stride=cfg.source.stride,
+            allow_default_intrinsics=cfg.source.allow_default_intrinsics,
         )
     if source_type == "video":
-        video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4")).resolve()
+        video_path = Path(cfg.source.video_path or (Path(data_dir) / "interim" / "synthetic.mp4")).expanduser()
+        if not video_path.is_absolute():
+            video_path = (Path.cwd() / video_path).resolve()
         if not video_path.exists():
             raise Uav3dError(f"Video file not found at: {video_path}")
-        return VideoFileSource(video_path=video_path)
+        return VideoFileSource(
+            video_path=video_path,
+            start_frame=cfg.ingest.start_frame,
+            max_frames=cfg.ingest.max_frames,
+        )
 
     raise Uav3dError(f"Unsupported source type '{source_type}'. Must be 'zurich' or 'video'.")
 
@@ -91,8 +217,8 @@ def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) 
 def _handle_inspect_command(args: argparse.Namespace) -> int:
     """Execute the inspect pipeline command."""
     logger = setup_logging()
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+    cfg = _load_pipeline_config(args)
+    data_dir = _resolve_data_dir(args, cfg)
 
     with timed_stage("inspect", logger=logger):
         source_type = cfg.source.type.lower()
@@ -133,9 +259,10 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
             table.add_row("Ground Truth Records (EVAL)", f"{source.total_gt_count:,} [yellow](eval only)[/yellow]")
 
             # Calculate coordinate ranges if GPS records exist
-            lats = [rec.lat for rec in source._gps_records.values() if rec.lat is not None]
-            lons = [rec.lon for rec in source._gps_records.values() if rec.lon is not None]
-            alts = [rec.alt for rec in source._gps_records.values() if rec.alt is not None]
+            gps_records = source.gps_records
+            lats = [rec.lat for rec in gps_records.values() if rec.lat is not None]
+            lons = [rec.lon for rec in gps_records.values() if rec.lon is not None]
+            alts = [rec.alt for rec in gps_records.values() if rec.alt is not None]
 
             if lats and lons:
                 table.add_row("Latitude Range", f"[{min(lats):.6f}, {max(lats):.6f}]")
@@ -157,8 +284,8 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
 def _handle_keyframes_command(args: argparse.Namespace) -> int:
     """Execute the keyframes extraction and filtering command."""
     logger = setup_logging()
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+    cfg = _load_pipeline_config(args)
+    data_dir = _resolve_data_dir(args, cfg)
 
     with timed_stage("keyframes", logger=logger):
         source = _build_source(cfg, data_dir, args)
@@ -177,6 +304,11 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         table.add_row("Decode Failures", str(summary.decode_failed_count))
         table.add_row("Initial Stride", str(summary.initial_stride))
         table.add_row("Final Stride", f"{summary.final_stride} (reductions: {summary.stride_reductions})")
+        table.add_row(
+            "Blur Gate",
+            f"{summary.min_blur_mode} = {summary.effective_min_blur:.1f} "
+            f"(rejected {summary.rejected_by_blur}, clipping {summary.rejected_by_clipping})",
+        )
         table.add_row(
             "Blur Score (med / p95)",
             f"{summary.blur_dist.median_val:.1f} / {summary.blur_dist.p95_val:.1f} (min: {summary.blur_dist.min_val:.1f})",
@@ -200,24 +332,15 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
 def _handle_sfm_command(args: argparse.Namespace) -> int:
     """Execute pycolmap incremental visual Structure-from-Motion."""
     logger = setup_logging()
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+    cfg = _load_pipeline_config(args)
+    data_dir = _resolve_data_dir(args, cfg)
 
     with timed_stage("sfm", logger=logger):
         # 1. Determine run directory
         if getattr(args, "run_dir", None):
             run_dir = Path(args.run_dir).resolve()
         else:
-            outputs_dir = Path(data_dir) / "outputs"
-            if not outputs_dir.exists():
-                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d keyframes' first.")
-            run_dirs = sorted(
-                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
-                key=lambda p: p.name,
-            )
-            if not run_dirs:
-                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d keyframes' first.")
-            run_dir = run_dirs[-1]
+            run_dir = _latest_run_dir(Path(data_dir) / "outputs", "keyframes", ("keyframes.json",))
 
         logger.info(f"Target SfM run directory: {run_dir}")
         images_dir = run_dir / "sfm" / "images"
@@ -254,7 +377,7 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
             w = actual_width or 1920
             h = actual_height or 1080
-            fx = fy = float(w) * 0.9
+            fx = fy = float(w) * DEFAULT_FOCAL_RATIO
             cx = float(w) / 2.0
             cy = float(h) / 2.0
             calibration = CameraCalibration(
@@ -265,10 +388,13 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
                 source=f"auto_video_{w}x{h}",
             )
             cfg.sfm.camera_model = "PINHOLE"
+            # A focal length derived from the frame width is a guess, so it must be refined by
+            # bundle adjustment; the run records that intrinsics were NOT locked.
             cfg.sfm.refine_intrinsics = True
             logger.info(
                 f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
-                f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
+                f"fx=fy={fx:.1f} (focal ratio {DEFAULT_FOCAL_RATIO}), cx={cx:.1f}, cy={cy:.1f}; "
+                f"refine_intrinsics={cfg.sfm.refine_intrinsics}"
             )
         else:
             source = _build_source(cfg, data_dir, args)
@@ -333,14 +459,23 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
 
         console.print(table)
 
-        if result.registration_rate < 0.85:
+        reg_target = cfg.validation.min_registration_rate
+        reproj_target = cfg.validation.max_reprojection_error_px
+        if result.registration_rate < reg_target:
             console.print(
-                "[yellow]Warning: Registration rate below 85% KPI. Consider increasing sequential overlap or adjusting keyframe stride.[/yellow]"
+                f"[yellow]Warning: Registration rate {result.registration_rate * 100:.1f}% is below the "
+                f"{reg_target * 100:.1f}% KPI. Consider increasing sequential overlap or adjusting keyframe stride.[/yellow]"
+            )
+        elif result.mean_reprojection_error_px > reproj_target:
+            console.print(
+                f"[yellow]Warning: Mean reprojection error {result.mean_reprojection_error_px:.3f} px exceeds the "
+                f"{reproj_target:.3f} px KPI.[/yellow]"
             )
         else:
             console.print(
-                f"[bold green]SfM Quality Gate Passed:[/bold green] Registration {result.registration_rate*100:.1f}% >= 85%, "
-                f"Reprojection Error {result.mean_reprojection_error_px:.3f} px <= 1.5 px."
+                f"[bold green]SfM Quality Gate Passed:[/bold green] Registration {result.registration_rate * 100:.1f}% "
+                f">= {reg_target * 100:.1f}%, Reprojection Error {result.mean_reprojection_error_px:.3f} px "
+                f"<= {reproj_target:.3f} px."
             )
 
     return 0
@@ -349,24 +484,15 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
 def _handle_sync_command(args: argparse.Namespace) -> int:
     """Execute telemetry synchronization and emit georef-ready outputs."""
     logger = setup_logging()
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+    cfg = _load_pipeline_config(args)
+    data_dir = _resolve_data_dir(args, cfg)
 
     with timed_stage("sync", logger=logger):
         # 1. Determine run directory
         if getattr(args, "run_dir", None):
             run_dir = Path(args.run_dir).resolve()
         else:
-            outputs_dir = Path(data_dir) / "outputs"
-            if not outputs_dir.exists():
-                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
-            run_dirs = sorted(
-                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
-                key=lambda p: p.name,
-            )
-            if not run_dirs:
-                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
-            run_dir = run_dirs[-1]
+            run_dir = _latest_run_dir(Path(data_dir) / "outputs", "sfm", ("poses.json",))
 
         logger.info(f"Target Sync run directory: {run_dir}")
         poses_path = run_dir / "poses.json"
@@ -381,11 +507,20 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
         poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
         kf_file = KeyframesFile.model_validate_json(keyframes_path.read_text(encoding="utf-8"))
 
-        # 3. Load source telemetry
-        source = _build_source(cfg, data_dir, args)
-        raw_telemetry = None
-        if hasattr(source, "_gps_records"):
-            raw_telemetry = source._gps_records
+        # 3. Load source telemetry (Zurich GPS logs) and/or a video manifest
+        video_override = getattr(args, "video", None)
+        if cfg.source.type.lower() == "video" and video_override is None:
+            video_override = cfg.source.video_path
+        if video_override is not None:
+            # Video runs carry no onboard log: use the authoritative frame manifest
+            # (<video_dir>/manifest.json unless --manifest is given).
+            manifest_path = _resolve_manifest_path(args, video_override)
+            raw_telemetry = None
+            logger.info(f"Video synchronization input: manifest={manifest_path}")
+        else:
+            source = _build_source(cfg, data_dir, args)
+            raw_telemetry = source.gps_records if isinstance(source, ZurichSequenceSource) else None
+            manifest_path = _resolve_manifest_path(args, None)
 
         # 4. Perform synchronization
         sync_mode = getattr(args, "mode", "auto")
@@ -394,6 +529,7 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
             poses=poses_file,
             keyframes=kf_file,
             raw_telemetry=raw_telemetry,
+            manifest_path=manifest_path,
             dataset_label=cfg.dataset_label,
             mode=sync_mode,
         )
@@ -440,61 +576,79 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
 def _handle_validate_command(args: argparse.Namespace) -> int:
     """Execute the trajectory validation (ATE) pipeline command against ground truth."""
     logger = setup_logging()
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+    cfg = _load_pipeline_config(args)
+    data_dir = _resolve_data_dir(args, cfg)
 
     with timed_stage("validate", logger=logger):
         # 1. Resolve run directory
         if args.run_dir:
             run_dir = Path(args.run_dir).resolve()
         else:
-            outputs_dir = Path(data_dir) / "outputs"
-            if not outputs_dir.exists():
-                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
-            run_dirs = sorted(
-                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
-                key=lambda p: p.name,
-            )
-            if not run_dirs:
-                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
-            run_dir = run_dirs[-1]
+            run_dir = _latest_run_dir(Path(data_dir) / "outputs", "sfm", ("poses.json",))
 
         logger.info(f"Target validation run directory: {run_dir}")
         poses_path = run_dir / "poses.json"
         if not poses_path.exists():
             raise Uav3dError(f"poses.json does not exist in {run_dir}. Run 'uav3d sfm' first.")
 
-        # 2. Resolve ground truth file
+        # 2. Load poses.json (needed to decide which ground truth belongs to this run)
+        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
+
+        # 3. Resolve ground truth file
         gt_file = None
         if getattr(args, "gt_file", None):
-            gt_file = Path(args.gt_file).resolve()
+            gt_file = Path(args.gt_file).expanduser().resolve()
+            if not gt_file.is_file():
+                raise Uav3dError(f"Ground truth file not found: {gt_file}")
         else:
-            candidates = [
+            # Ground truth must belong to the same run/provenance: a video run must not be
+            # silently validated against the Zurich dataset's GT (or vice versa).
+            dataset_dir = _resolve_dataset_dir(cfg, Path(data_dir), args)
+            dataset_candidates = [
+                dataset_dir / "Log Files" / "GroundTruthAGL.csv",
+                dataset_dir / "GroundTruthAGL.csv",
+                *dataset_dir.glob("**/Log Files/GroundTruthAGL.csv"),
                 Path(data_dir) / "raw" / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
                 Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
                 Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
             ]
+
+            video_arg = getattr(args, "video", None)
+            if video_arg is None and cfg.source.type.lower() == "video":
+                video_arg = cfg.source.video_path
+            video_candidates: list[Path] = []
+            if video_arg:
+                video_dir = Path(str(video_arg)).expanduser()
+                video_dir = (Path.cwd() / video_dir).resolve().parent if not video_dir.is_absolute() else video_dir.resolve().parent
+                video_candidates = [
+                    video_dir / "ground_truth_agl.csv",
+                    video_dir / "GroundTruthAGL.csv",
+                ]
+
+            is_video_run = bool(video_candidates) or any(
+                p.frame_id.startswith("video_") for p in poses_file.poses
+            )
+            candidates = video_candidates + dataset_candidates if is_video_run else dataset_candidates
+
             for c in candidates:
-                if c.exists():
-                    gt_file = c
+                if c.is_file():
+                    gt_file = c.resolve()
+                    logger.info(f"Selected ground truth file ({'video' if is_video_run else 'dataset'} run): {gt_file}")
                     break
 
         if gt_file is None or not gt_file.exists():
             raise Uav3dError(
-                f"Ground truth file GroundTruthAGL.csv not found in standard paths under {data_dir}. "
+                f"Ground truth file GroundTruthAGL.csv not found under {data_dir}. "
                 "Please specify path with --gt-file."
             )
 
         logger.info(f"Using ground truth file: {gt_file}")
 
-        # 3. Load poses.json
-        poses_file = PosesFile.model_validate_json(poses_path.read_text(encoding="utf-8"))
-
         # 4. Compute ATE metrics and alignment
         ate_report = compute_ate(
             poses_file=poses_file,
             gt_records=gt_file,
-            ate_threshold_m=5.0,
+            ate_threshold_m=cfg.validation.ate_threshold_meters,
             dataset_label=cfg.dataset_label,
         )
 
@@ -519,6 +673,8 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         table.add_column("Value", style="green")
 
         m = ate_report.metrics
+        reg_target = cfg.validation.min_registration_rate
+        reproj_target = cfg.validation.max_reprojection_error_px
         table.add_row("Run Directory", str(run_dir))
         table.add_row("Dataset Provenance", ate_report.dataset_label)
         table.add_row("Matched Frames (SfM & GT)", f"{m.num_matched_frames} / {m.num_registered_frames}")
@@ -531,13 +687,25 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
         table.add_row("ATE Max Error", f"{m.max_m:.4f} m")
 
         if m.registration_rate is not None:
-            reg_style = "bold green" if m.registration_rate >= 0.85 else "bold red"
-            table.add_row("Registration Rate (KPI >= 85%)", f"[{reg_style}]{m.registration_rate * 100:.1f}%[/{reg_style}]")
+            reg_style = "bold green" if m.registration_rate >= reg_target else "bold red"
+            table.add_row(
+                f"Registration Rate (KPI >= {reg_target * 100:.0f}%)",
+                f"[{reg_style}]{m.registration_rate * 100:.1f}%[/{reg_style}]",
+            )
 
         if m.mean_reprojection_error_px is not None:
-            reproj_style = "bold green" if m.mean_reprojection_error_px <= 1.5 else "bold red"
-            table.add_row("Reprojection Error (KPI <= 1.5px)", f"[{reproj_style}]{m.mean_reprojection_error_px:.3f} px[/{reproj_style}]")
+            reproj_style = "bold green" if m.mean_reprojection_error_px <= reproj_target else "bold red"
+            table.add_row(
+                f"Reprojection Error (KPI <= {reproj_target:g}px)",
+                f"[{reproj_style}]{m.mean_reprojection_error_px:.3f} px[/{reproj_style}]",
+            )
 
+        ate_target = cfg.validation.ate_threshold_meters
+        ate_style = "bold green" if m.rmse_m <= ate_target else "bold red"
+        table.add_row(
+            f"ATE KPI (<= {ate_target:g} m)",
+            f"[{ate_style}]{'PASSED' if m.rmse_m <= ate_target else 'FAILED'}[/{ate_style}]",
+        )
         table.add_row("Validation Status", f"[bold green]{ate_report.status.upper()}[/bold green]")
         table.add_row("Report Artifacts", f"ate_report.json, SP1_REPORT.md, {', '.join(plots.values())}")
 
@@ -548,8 +716,8 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
 def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
     """Execute stub for unimplemented pipeline stage."""
     logger = setup_logging()
-    cfg = load_config(args.config if os.path.exists(args.config) else None)
-    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+    cfg = _load_pipeline_config(args)
+    data_dir = _resolve_data_dir(args, cfg)
 
     with timed_stage(command_name, logger=logger):
         console.print(
@@ -631,6 +799,15 @@ def create_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Telemetry synchronization mode (auto, zurich, or video)",
     )
+    sync_parser.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help=(
+            "Frame manifest JSON mapping video frames to telemetry (default: "
+            "<video_dir>/manifest.json when it exists)"
+        ),
+    )
 
     # 5. validate
     validate_parser = subparsers.add_parser(
@@ -680,7 +857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Uav3dError as exc:
         err_console.print(f"[bold red]Error:[/bold red] {exc}")
         return 1
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         err_console.print(f"[bold red]Unexpected failure:[/bold red] {exc}")
         return 2
 

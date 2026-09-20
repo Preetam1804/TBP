@@ -1,7 +1,19 @@
-"""Defensive parsers for Zurich Urban MAV onboard GPS and ground truth logs."""
+"""Defensive parsers for Zurich Urban MAV onboard GPS and ground truth logs.
+
+Real-data format notes (ETH RPG ``AGZ/readme.txt``):
+
+* ``OnbordGPS.csv``  — ``1: timestamp, 2: imgid, 3: lat (1E7 degrees),
+  4: lon (1E7 degrees), 5: alt (1E3 meters, i.e. millimetres above MSL), 6..: accuracy/velocity``.
+* ``GroundTruthAGL.csv`` — ``1: imgid, 2: x_gt, 3: y_gt, 4: z_gt`` in WGS 84 / UTM zone 32N metres.
+* Column meanings are documented by position; the shipped datasets may or may not carry a header
+  line, and the timestamp column is ambiguous between the IJRR paper text ("milliseconds") and the
+  dataset website ("microseconds"). Both cases are therefore detected from the data itself instead
+  of being hardcoded.
+"""
 
 import csv
 import logging
+import math
 from pathlib import Path
 from typing import NamedTuple
 
@@ -9,9 +21,25 @@ from uav3d.exceptions import DataError
 
 logger = logging.getLogger("uav3d.telemetry")
 
+# Documented Zuricher GPS scaling factors.
+GPS_LAT_LON_SCALE = 1e7
+GPS_ALTITUDE_SCALE = 1e3
+
+# Plausible Unix-epoch window used to disambiguate the timestamp unit: 2000-01-01 .. 2100-01-01.
+_EPOCH_MIN_US = 946_684_800_000_000
+_EPOCH_MAX_US = 4_102_444_800_000_000
+
+# Physical sanity bands (degrees / metres).
+_LAT_LIMIT = 90.0
+_LON_LIMIT = 180.0
+_ALTITUDE_BAND_M = (-2000.0, 20000.0)
+
+_POSITIONAL_GPS_COLUMNS = ["timestamp", "image_id", "lat", "lon", "alt"]
+_POSITIONAL_GT_COLUMNS = ["image_id", "x", "y", "z"]
+
 
 class ZurichGpsRecord(NamedTuple):
-    """Parsed Zurich onboard GPS entry."""
+    """Parsed Zurich onboard GPS entry (coordinates normalised to degrees/metres)."""
 
     timestamp_us: int
     image_id: int
@@ -35,13 +63,120 @@ class ZurichGroundTruthRecord(NamedTuple):
     is_evaluation_only: bool = True
 
 
+def _is_number(text: str) -> bool:
+    """Return True if a cell is a (possibly signed/scientific) number."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value)
+
+
+def normalize_timestamp_us(raw_value: float) -> tuple[int, str]:
+    """Normalize a logged timestamp to integer microseconds.
+
+    The dataset documentation is inconsistent (milliseconds vs microseconds), so the unit is
+    inferred from the value itself: prefer the interpretation that lands inside a plausible
+    Unix-epoch window, otherwise fall back to an order-of-magnitude rule for boot-relative clocks.
+
+    Returns:
+        tuple of (timestamp_us, human-readable description of the detected unit).
+    """
+    # Candidates are (multiplier_to_microseconds, unit_label), ordered so that the most common
+    # encodings win when several interpretations are epoch-plausible:
+    # microseconds x1, milliseconds x1e3, nanoseconds x1e-3, seconds x1e6.
+    for scale, label in ((1.0, "microseconds"), (1e3, "milliseconds"), (1e-3, "nanoseconds"), (1e6, "seconds")):
+        candidate = raw_value * scale
+        if _EPOCH_MIN_US <= candidate <= _EPOCH_MAX_US:
+            return round(candidate), label
+
+    # No epoch-plausible interpretation: the clock is likely boot-relative (PX4 autopilot clock).
+    magnitude = abs(raw_value)
+    if magnitude >= 1e14:
+        return round(raw_value), "microseconds (boot-relative clock)"
+    if magnitude >= 1e11:
+        return round(raw_value * 1e3), "milliseconds (boot-relative clock)"
+    if magnitude >= 1e8:
+        return round(raw_value), "microseconds (boot-relative clock)"
+    return round(raw_value * 1e6), "seconds (boot-relative clock)"
+
+
+def _normalize_latitude(value: float) -> float:
+    """Normalize a latitude that may use the documented 1E7 fixed-point scaling."""
+    if abs(value) <= _LAT_LIMIT:
+        return value
+    scaled = value / GPS_LAT_LON_SCALE
+    if abs(scaled) <= _LAT_LIMIT:
+        return scaled
+    raise DataError(f"Invalid latitude {value}: neither degrees nor 1E7-scaled degrees are plausible")
+
+
+def _normalize_longitude(value: float) -> float:
+    """Normalize a longitude that may use the documented 1E7 fixed-point scaling."""
+    if abs(value) <= _LON_LIMIT:
+        return value
+    scaled = value / GPS_LAT_LON_SCALE
+    if abs(scaled) <= _LON_LIMIT:
+        return scaled
+    raise DataError(f"Invalid longitude {value}: neither degrees nor 1E7-scaled degrees are plausible")
+
+
+def _normalize_altitude(value: float) -> float:
+    """Normalize an altitude that may be logged in millimetres (documented 1E3 scaling)."""
+    low, high = _ALTITUDE_BAND_M
+    if low <= value <= high:
+        return value
+    scaled = value / GPS_ALTITUDE_SCALE
+    if low <= scaled <= high:
+        return scaled
+    raise DataError(f"Invalid altitude {value}: neither metres nor millimetres are plausible")
+
+
+def _read_header_and_first_data_row(reader: "csv._reader", path: Path, positional_columns: list[str]) -> tuple[list[str], list[str] | None]:
+    """Detect a header row and return (header_names, first_data_row_or_None).
+
+    Skips blank rows and pure-comment rows. A first non-empty row without a leading '#'
+    whose cells are all numeric is treated as data (the files are documented column-by-column,
+    so a header line is optional) and returned as the first data row.
+    """
+    for row in reader:
+        if not row or all(not cell.strip() for cell in row):
+            continue
+        if row[0].lstrip().startswith("#"):
+            headers = [h.strip().lstrip("#").strip() for h in row]
+            logger.info(f"{path.name}: header detected -> {headers}")
+            return headers, None
+        if all(_is_number(cell.strip()) for cell in row if cell.strip()):
+            logger.info(
+                f"{path.name}: no header row detected; using positional columns {positional_columns}"
+            )
+            return list(positional_columns), row
+        # Non-numeric, non-comment first row: treat it as a header (names as written).
+        headers = [h.strip().lstrip("#").strip() for h in row]
+        logger.info(f"{path.name}: header detected -> {headers}")
+        return headers, None
+
+    return list(positional_columns), None
+
+
+def _column_index(headers: list[str], keywords: tuple[str, ...], default: int) -> int:
+    """Find the first column whose name contains any keyword, else return the default index."""
+    for idx, name in enumerate(headers):
+        lower = name.lower()
+        if any(keyword in lower for keyword in keywords):
+            return idx
+    return default
+
+
 def parse_onboard_gps(csv_path: Path | str) -> tuple[dict[int, ZurichGpsRecord], int]:
     """Parse OnbordGPS.csv defensively into a mapping of image_id -> ZurichGpsRecord.
 
     Rules:
-    - Reads and logs header columns dynamically (never hardcodes column counts).
-    - Normalizes timestamps to integer microseconds.
-    - Fails loudly (DataError) on duplicate image IDs.
+    - Header is optional; columns are resolved by name when present, by documented position otherwise.
+    - Latitude/longitude are normalised from the documented 1E7 fixed-point encoding to degrees,
+      altitude from millimetres to metres, timestamps to integer microseconds (units auto-detected).
+    - Applied scalings are recorded per row in ``raw_fields`` for traceability.
+    - Fails loudly (DataError) on duplicate image IDs or physically impossible coordinates.
     - Skips and counts malformed rows with warnings.
 
     Returns:
@@ -54,49 +189,28 @@ def parse_onboard_gps(csv_path: Path | str) -> tuple[dict[int, ZurichGpsRecord],
     records: dict[int, ZurichGpsRecord] = {}
     skipped_count = 0
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
-        try:
-            header = next(reader)
-        except StopIteration:
-            return records, 0
+        headers, first_data_row = _read_header_and_first_data_row(reader, path, _POSITIONAL_GPS_COLUMNS)
 
-        # Clean header strings
-        headers = [h.strip().lstrip("#").strip() for h in header]
-        logger.info(f"Parsing {path.name} with columns: {headers}")
+        ts_idx = _column_index(headers, ("time", "stamp"), 0)
+        img_idx = _column_index(headers, ("image", "img", "frame", "id"), 1)
+        lat_idx = _column_index(headers, ("lat",), 2)
+        lon_idx = _column_index(headers, ("lon",), 3)
+        alt_idx = _column_index(headers, ("alt", "height", "elev"), 4)
 
-        # Determine column indexes defensively
-        ts_idx = 0
-        img_idx = 1
-        lat_idx: int | None = None
-        lon_idx: int | None = None
-        alt_idx: int | None = None
-
-        for idx, col_name in enumerate(headers):
-            lower = col_name.lower()
-            if "time" in lower and idx < 2:
-                ts_idx = idx
-            elif ("image" in lower or "frame" in lower or "id" in lower) and idx < 2:
-                img_idx = idx
-            elif "lat" in lower and lat_idx is None:
-                lat_idx = idx
-            elif "lon" in lower and lon_idx is None:
-                lon_idx = idx
-            elif ("alt" in lower or "height" in lower or "elev" in lower) and alt_idx is None:
-                alt_idx = idx
-
-        # Fallback heuristic for standard Zurich GPS layout if not named in header
-        if lat_idx is None and len(headers) > 2:
-            lat_idx = 2
-        if lon_idx is None and len(headers) > 3:
-            lon_idx = 3
-        if alt_idx is None and len(headers) > 4:
-            alt_idx = 4
+        rows = [first_data_row, *reader] if first_data_row is not None else list(reader)
+        timestamp_unit: str | None = None
+        lat_scale_applied = False
+        lon_scale_applied = False
+        alt_scale_applied = False
 
         line_num = 1
-        for row in reader:
+        for row in rows:
             line_num += 1
             if not row or all(not cell.strip() for cell in row):
+                continue
+            if row[0].lstrip().startswith("#"):
                 continue
 
             if len(row) < 2:
@@ -105,11 +219,13 @@ def parse_onboard_gps(csv_path: Path | str) -> tuple[dict[int, ZurichGpsRecord],
                 continue
 
             try:
-                # Parse timestamp into integer microseconds
                 raw_ts = float(row[ts_idx].strip())
-                timestamp_us = int(raw_ts)
+                timestamp_us, unit = normalize_timestamp_us(raw_ts)
+                if timestamp_unit is None:
+                    timestamp_unit = unit
+                    logger.info(f"{path.name}: timestamps interpreted as {unit} (e.g. {raw_ts} -> {timestamp_us} us)")
 
-                # Parse image_id
+                # image_id may be logged with a decimal point (e.g. "12.0")
                 image_id = int(float(row[img_idx].strip()))
             except (ValueError, IndexError) as exc:
                 logger.warning(f"Skipping malformed row at line {line_num} in {path.name}: {exc}")
@@ -123,32 +239,39 @@ def parse_onboard_gps(csv_path: Path | str) -> tuple[dict[int, ZurichGpsRecord],
                     f"(previously registered with timestamp {records[image_id].timestamp_us} µs)"
                 )
 
-            # Optional GPS coordinate parsing
-            lat = None
-            lon = None
-            alt = None
-            if lat_idx is not None and lat_idx < len(row):
-                try:
-                    lat = float(row[lat_idx].strip())
-                except ValueError:
-                    lat = None
-
-            if lon_idx is not None and lon_idx < len(row):
-                try:
-                    lon = float(row[lon_idx].strip())
-                except ValueError:
-                    lon = None
-
-            if alt_idx is not None and alt_idx < len(row):
-                try:
-                    alt = float(row[alt_idx].strip())
-                except ValueError:
-                    alt = None
+            lat = lon = alt = None
+            try:
+                if lat_idx < len(row) and row[lat_idx].strip():
+                    raw_lat = float(row[lat_idx].strip())
+                    lat = _normalize_latitude(raw_lat)
+                    lat_scale_applied = lat_scale_applied or raw_lat != lat
+                if lon_idx < len(row) and row[lon_idx].strip():
+                    raw_lon = float(row[lon_idx].strip())
+                    lon = _normalize_longitude(raw_lon)
+                    lon_scale_applied = lon_scale_applied or raw_lon != lon
+                if alt_idx < len(row) and row[alt_idx].strip():
+                    raw_alt = float(row[alt_idx].strip())
+                    alt = _normalize_altitude(raw_alt)
+                    alt_scale_applied = alt_scale_applied or raw_alt != alt
+            except (ValueError, DataError) as exc:
+                logger.warning(f"Skipping malformed row at line {line_num} in {path.name}: {exc}")
+                skipped_count += 1
+                continue
 
             raw_dict: dict[str, str] = {}
             for col_i, cell in enumerate(row):
                 key = headers[col_i] if col_i < len(headers) else f"col_{col_i}"
                 raw_dict[key] = cell.strip()
+
+            # Traceability: record the normalisation applied to this row.
+            raw_dict["_timestamp_us"] = str(timestamp_us)
+            raw_dict["_timestamp_unit_detected"] = timestamp_unit or "unknown"
+            if lat_scale_applied:
+                raw_dict["_lat_scale"] = f"1/{GPS_LAT_LON_SCALE:.0e}"
+            if lon_scale_applied:
+                raw_dict["_lon_scale"] = f"1/{GPS_LAT_LON_SCALE:.0e}"
+            if alt_scale_applied:
+                raw_dict["_alt_scale"] = f"1/{GPS_ALTITUDE_SCALE:.0e}"
 
             records[image_id] = ZurichGpsRecord(
                 timestamp_us=timestamp_us,
@@ -159,12 +282,18 @@ def parse_onboard_gps(csv_path: Path | str) -> tuple[dict[int, ZurichGpsRecord],
                 raw_fields=raw_dict,
             )
 
+    if lat_scale_applied or lon_scale_applied or alt_scale_applied:
+        logger.info(
+            f"{path.name}: normalised fixed-point GPS encoding "
+            f"(lat/lon 1E7 applied: {lat_scale_applied}/{lon_scale_applied}, alt 1E3 applied: {alt_scale_applied})"
+        )
+
     logger.info(f"Loaded {len(records)} GPS records from {path.name} ({skipped_count} rows skipped)")
     return records, skipped_count
 
 
 def parse_ground_truth_agl(csv_path: Path | str) -> tuple[dict[int, ZurichGroundTruthRecord], int]:
-    """Parse GroundTruthAGL.csv (image_id -> XYZ coordinates).
+    """Parse GroundTruthAGL.csv (image_id -> XYZ in WGS 84 / UTM zone 32N metres).
 
     STRICTLY FOR EVALUATION ONLY. Must never be used as input to SfM.
 
@@ -178,36 +307,24 @@ def parse_ground_truth_agl(csv_path: Path | str) -> tuple[dict[int, ZurichGround
     records: dict[int, ZurichGroundTruthRecord] = {}
     skipped_count = 0
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
-        try:
-            header = next(reader)
-        except StopIteration:
-            return records, 0
-
-        headers = [h.strip().lstrip("#").strip() for h in header]
+        headers, first_data_row = _read_header_and_first_data_row(reader, path, _POSITIONAL_GT_COLUMNS)
         logger.info(f"Parsing Ground Truth (EVALUATION ONLY) {path.name} with columns: {headers}")
 
-        img_idx = 0
-        x_idx = 1
-        y_idx = 2
-        z_idx = 3
+        img_idx = _column_index(headers, ("image", "img", "frame", "id"), 0)
+        x_idx = _column_index(headers, ("x",), 1)
+        y_idx = _column_index(headers, ("y",), 2)
+        z_idx = _column_index(headers, ("z", "alt", "height"), 3)
 
-        for idx, col_name in enumerate(headers):
-            lower = col_name.lower()
-            if ("image" in lower or "frame" in lower or "id" in lower) and img_idx == 0:
-                img_idx = idx
-            elif lower in ("x", "pos_x", "easting") and x_idx == 1:
-                x_idx = idx
-            elif lower in ("y", "pos_y", "northing") and y_idx == 2:
-                y_idx = idx
-            elif lower in ("z", "pos_z", "alt", "height") and z_idx == 3:
-                z_idx = idx
+        rows = [first_data_row, *reader] if first_data_row is not None else list(reader)
 
         line_num = 1
-        for row in reader:
+        for row in rows:
             line_num += 1
             if not row or all(not cell.strip() for cell in row):
+                continue
+            if row[0].lstrip().startswith("#"):
                 continue
 
             if len(row) < 4:

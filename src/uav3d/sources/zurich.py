@@ -4,6 +4,7 @@ import logging
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -23,6 +24,100 @@ logger = logging.getLogger("uav3d.sources.zurich")
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 
+# Documented fallback intrinsics for the GoPro Hero4 at 1080p (used only when explicitly allowed).
+DEFAULT_INTRINSICS_PINHOLE = [1060.0, 1060.0, 960.0, 540.0]
+
+# Accepted key spellings inside calibration_data.npz (the file is not documented column-by-column).
+_CAMERA_MATRIX_KEYS = ("camera_matrix", "camera_mat", "cameramatrix", "k", "mtx", "intrinsics")
+_DISTORTION_KEYS = ("distortion_coefficients", "distortion", "dist_coeffs", "dist", "d")
+
+# COLMAP camera model -> parameterisation, derived from the distortion coefficient count.
+_MODEL_BY_DISTORTION_COUNT = {
+    0: "PINHOLE",
+    4: "OPENCV",
+    5: "FULL_OPENCV",
+    8: "FULL_OPENCV",
+}
+
+
+def _find_npz_key(keys: tuple[str, ...], available: list[str]) -> str | None:
+    """Return the first available key matching a known spelling (case/format tolerant)."""
+    normalised = {name.lower().replace("-", "_").replace(" ", "_"): name for name in available}
+    for key in keys:
+        if key in normalised:
+            return normalised[key]
+    for key in keys:
+        for normalised_name, original in normalised.items():
+            if key in normalised_name:
+                return original
+    return None
+
+
+def build_camera_calibration(
+    camera_matrix: Any,
+    distortion: Any,
+    width: int = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
+    source: str = "calibration_data.npz",
+) -> CameraCalibration:
+    """Build a CameraCalibration from a 3x3 intrinsic matrix and distortion coefficients.
+
+    Maps the OpenCV convention (k1, k2, p1, p2[, k3, k4, k5, k6]) onto the closest COLMAP
+    camera model, and fails loudly for coefficient counts that cannot be represented.
+
+    Args:
+        camera_matrix: 3x3 intrinsic matrix (list/ndarray).
+        distortion: Distortion coefficient sequence (may be empty or all zeros for pinhole).
+        width: Image width in pixels.
+        height: Image height in pixels.
+        source: Provenance label recorded in the output schema.
+
+    Returns:
+        CameraCalibration with COLMAP-compatible params.
+    """
+    k = np.asarray(camera_matrix, dtype=np.float64)
+    if k.shape != (3, 3):
+        raise DataError(f"Camera matrix must be 3x3, got shape {k.shape}")
+
+    fx, fy = float(k[0, 0]), float(k[1, 1])
+    cx, cy = float(k[0, 2]), float(k[1, 2])
+    if fx <= 0.0 or fy <= 0.0:
+        raise DataError(
+            f"Calibration contains non-positive focal lengths (fx={fx}, fy={fy}); the file is not a valid camera matrix"
+        )
+
+    coeffs = np.asarray(distortion, dtype=np.float64).flatten() if distortion is not None else np.zeros(0)
+    coeffs = np.array([c for c in coeffs if np.isfinite(c)], dtype=np.float64)
+
+    if coeffs.size == 0 or np.allclose(coeffs, 0.0):
+        model = "PINHOLE"
+        params = [fx, fy, cx, cy]
+    elif coeffs.size == 4:
+        model = "OPENCV"
+        params = [fx, fy, cx, cy, *coeffs.tolist()]
+    elif coeffs.size == 5:
+        # OpenCV orders k1, k2, p1, p2, k3 -> COLMAP FULL_OPENCV expects k1, k2, p1, p2, k3, k4, k5, k6
+        model = "FULL_OPENCV"
+        params = [fx, fy, cx, cy, *coeffs.tolist(), 0.0, 0.0, 0.0]
+    elif coeffs.size == 8:
+        # OpenCV orders k1, k2, p1, p2, k3, k4, k5, k6 -> COLMAP FULL_OPENCV is identical
+        model = "FULL_OPENCV"
+        params = [fx, fy, cx, cy, *coeffs.tolist()]
+    else:
+        raise DataError(
+            f"Unsupported distortion coefficient count {coeffs.size} in {source}; "
+            "expected 0 (pinhole), 4 (k1,k2,p1,p2), 5 (+k3) or 8 (k1..k6)"
+        )
+
+    logger.info(f"Camera calibration from {source}: model={model}, params={[round(p, 4) for p in params]}")
+    return CameraCalibration(
+        model=model,
+        width=width,
+        height=height,
+        params=params,
+        source=source,
+    )
+
 
 class ZurichSequenceSource(ImageSource):
     """Adapter for the ETH RPG Zurich Urban MAV dataset.
@@ -37,12 +132,14 @@ class ZurichSequenceSource(ImageSource):
         start_id: int = 0,
         count: int = 250,
         stride: int = 1,
+        allow_default_intrinsics: bool = False,
     ) -> None:
         self.dataset_dir = Path(dataset_dir).resolve()
         self.start_id = max(0, start_id)
         # Cap subset count to 300 per specification
         self.count = min(300, max(1, count))
         self.stride = max(1, stride)
+        self.allow_default_intrinsics = allow_default_intrinsics
 
         # 1. Validate paths and discover directory layout
         self.images_dir, self.gps_file, self.gt_file, self.calib_file = self._resolve_dataset_paths()
@@ -55,6 +152,14 @@ class ZurichSequenceSource(ImageSource):
         self._gt_records: dict[int, ZurichGroundTruthRecord] = {}
         if self.gt_file and self.gt_file.exists():
             self._gt_records, _ = parse_ground_truth_agl(self.gt_file)
+
+        # 2b. Log the resolved dataset layout so a wrong auto-detection is immediately visible.
+        logger.info(
+            f"Dataset layout: images={self.images_dir.name}, gps="
+            f"{self.gps_file.name if self.gps_file else 'none'}, ground_truth="
+            f"{self.gt_file.name if self.gt_file else 'none'}, calibration="
+            f"{self.calib_file.name if self.calib_file else 'none'}"
+        )
 
         # 3. Discover and numerically sort all available images
         self._all_image_ids, self._image_paths = self._discover_images()
@@ -87,10 +192,20 @@ class ZurichSequenceSource(ImageSource):
                 break
 
         if images_dir is None:
-            # Check if any subfolder contains images
-            subfolders_with_jpg = [d for d in self.dataset_dir.iterdir() if d.is_dir() and any(d.glob("*.jp*g"))]
+            # Fallback: any subfolder holding images, chosen deterministically (name order) and
+            # logged, so the same dataset always resolves to the same frame set.
+            subfolders_with_jpg = sorted(
+                (d for d in self.dataset_dir.iterdir() if d.is_dir() and any(d.glob("*.jp*g"))),
+                key=lambda d: d.name,
+            )
             if subfolders_with_jpg:
                 images_dir = subfolders_with_jpg[0].resolve()
+                if len(subfolders_with_jpg) > 1:
+                    logger.warning(
+                        f"Multiple image folders found in {self.dataset_dir} "
+                        f"({[d.name for d in subfolders_with_jpg]}); using '{images_dir.name}' "
+                        "(first in name order)"
+                    )
             else:
                 missing_components.append("Images folder (e.g. 'MAV Images/' or '*.jpg' files)")
 
@@ -144,21 +259,43 @@ class ZurichSequenceSource(ImageSource):
         return images_dir, gps_file, gt_file, calib_file
 
     def _discover_images(self) -> tuple[list[int], dict[int, Path]]:
-        """Discover image files and sort them numerically by numeric ID."""
+        """Discover image files, keyed by numeric id, failing loudly on duplicate ids.
+
+        Two files resolving to the same numeric id (e.g. ``frame_000012.jpg`` next to
+        ``zurich_000012.jpg``, or a synthetic set generated on top of a real one) would silently
+        drop one frame and pair the other with the wrong telemetry row, so it is an error.
+        """
         pattern = re.compile(r"(\d+)")
         image_map: dict[int, Path] = {}
+        seen_paths: set[Path] = set()
 
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"):
-            for img_path in self.images_dir.glob(ext):
+            for img_path in sorted(self.images_dir.glob(ext)):
+                resolved = img_path.resolve()
+                if resolved in seen_paths:
+                    continue  # same file matched by more than one extension pattern
+                seen_paths.add(resolved)
+
                 match = pattern.findall(img_path.stem)
-                if match:
-                    numeric_id = int(match[-1])
-                    image_map[numeric_id] = img_path.resolve()
+                if not match:
+                    continue
+                numeric_id = int(match[-1])
+                if numeric_id in image_map:
+                    raise DataError(
+                        f"Duplicate numeric image id {numeric_id} in {self.images_dir}: "
+                        f"'{image_map[numeric_id].name}' and '{img_path.name}'. "
+                        "Frame ids must be unique; remove the duplicate or use a clean dataset directory."
+                    )
+                image_map[numeric_id] = resolved
 
         if not image_map:
             raise DataError(f"No numeric image files found in {self.images_dir}")
 
         sorted_ids = sorted(image_map.keys())
+        logger.info(
+            f"Image layout: {len(sorted_ids)} frames in {self.images_dir} "
+            f"(ids {sorted_ids[0]}..{sorted_ids[-1]})"
+        )
         return sorted_ids, image_map
 
     def _select_subset(self) -> list[int]:
@@ -233,40 +370,65 @@ class ZurichSequenceSource(ImageSource):
         )
 
     def calibration(self) -> CameraCalibration:
-        """Load intrinsic camera calibration from calibration_data.npz or provide default GoPro Hero4."""
-        if self.calib_file and self.calib_file.exists():
-            try:
-                npz = np.load(self.calib_file)
-                # Standard keys in calibration npz files
-                if "camera_matrix" in npz:
-                    K = npz["camera_matrix"]
-                    fx, fy = float(K[0, 0]), float(K[1, 1])
-                    cx, cy = float(K[0, 2]), float(K[1, 2])
-                    params = [fx, fy, cx, cy]
-                    model = "PINHOLE"
-                    if "distortion_coefficients" in npz:
-                        d = npz["distortion_coefficients"].flatten()
-                        params.extend([float(v) for v in d[:4]])
-                        model = "OPENCV"
-                    return CameraCalibration(
-                        model=model,
-                        width=DEFAULT_WIDTH,
-                        height=DEFAULT_HEIGHT,
-                        params=params,
-                        source=str(self.calib_file.name),
-                    )
-            except (OSError, ValueError, KeyError) as exc:
-                logger.warning(f"Could not load calibration from {self.calib_file}: {exc}")
+        """Load intrinsic calibration from calibration_data.npz.
 
-        # Default calibrated intrinsics for GoPro Hero4 1080p from Zurich MAV dataset
-        # K = [fx: 1060.0, fy: 1060.0, cx: 960.0, cy: 540.0]
-        return CameraCalibration(
-            model="PINHOLE",
-            width=DEFAULT_WIDTH,
-            height=DEFAULT_HEIGHT,
-            params=[1060.0, 1060.0, 960.0, 540.0],
-            source="zurich_default_intrinsics",
-        )
+        The npz key names are not formally documented, so several known spellings are accepted
+        and the available keys are logged. If no camera matrix can be found the run fails loudly
+        (``DataError``) unless ``allow_default_intrinsics`` was explicitly enabled, in which case
+        the documented GoPro Hero4 1080p fallback is used and clearly labelled as such.
+        """
+        if not self.calib_file or not self.calib_file.exists():
+            if self.allow_default_intrinsics:
+                logger.warning(
+                    "No calibration_data.npz found; falling back to the documented GoPro Hero4 defaults "
+                    f"{DEFAULT_INTRINSICS_PINHOLE} (source.allow_default_intrinsics=true)"
+                )
+                return CameraCalibration(
+                    model="PINHOLE",
+                    width=DEFAULT_WIDTH,
+                    height=DEFAULT_HEIGHT,
+                    params=list(DEFAULT_INTRINSICS_PINHOLE),
+                    source="zurich_default_intrinsics",
+                )
+            raise DataError(
+                f"No calibration_data.npz found in {self.dataset_dir}. Provide the dataset calibration file, "
+                "or set source.allow_default_intrinsics: true to use the documented GoPro Hero4 defaults."
+            )
+
+        try:
+            with np.load(self.calib_file) as npz:
+                available_keys = list(npz.files)
+                logger.info(f"calibration_data.npz keys: {available_keys}")
+
+                matrix_key = _find_npz_key(_CAMERA_MATRIX_KEYS, available_keys)
+                if matrix_key is None:
+                    raise DataError(
+                        f"No camera matrix found in {self.calib_file.name}; available keys: {available_keys}. "
+                        f"Expected one of {list(_CAMERA_MATRIX_KEYS)}"
+                    )
+                camera_matrix = npz[matrix_key]
+
+                dist_key = _find_npz_key(_DISTORTION_KEYS, available_keys)
+                distortion = npz[dist_key] if dist_key is not None else None
+                if dist_key is None:
+                    logger.info(
+                        f"No distortion coefficients found in {self.calib_file.name} "
+                        f"(keys: {available_keys}); using a pinhole model"
+                    )
+                else:
+                    logger.info(f"Using '{matrix_key}' and '{dist_key}' from {self.calib_file.name}")
+
+            return build_camera_calibration(
+                camera_matrix=camera_matrix,
+                distortion=distortion,
+                width=DEFAULT_WIDTH,
+                height=DEFAULT_HEIGHT,
+                source=str(self.calib_file.name),
+            )
+        except DataError:
+            raise
+        except (OSError, ValueError, KeyError) as exc:
+            raise DataError(f"Could not load calibration from {self.calib_file}: {exc}") from exc
 
     def iter_frames(self) -> Iterator[FrameRecord]:
         """Lazily iterate over FrameRecords without loading images into memory."""
@@ -305,6 +467,16 @@ class ZurichSequenceSource(ImageSource):
         if not match:
             return None
         return self._gt_records.get(int(match.group(1)))
+
+    @property
+    def gps_records(self) -> dict[int, ZurichGpsRecord]:
+        """Onboard GPS telemetry keyed by dataset image id (public accessor)."""
+        return self._gps_records
+
+    @property
+    def ground_truth_records(self) -> dict[int, ZurichGroundTruthRecord]:
+        """Ground truth positions keyed by dataset image id (EVALUATION ONLY)."""
+        return self._gt_records
 
     @property
     def total_gps_count(self) -> int:

@@ -1,6 +1,5 @@
 """Export COLMAP reconstruction to validated PosesFile schema."""
 
-import json
 import logging
 from pathlib import Path
 from typing import Any

@@ -5,7 +5,6 @@ import json
 import random
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from uav3d.config import SyncConfig
@@ -352,3 +351,41 @@ class TestSyncCliAndImmutability:
         loaded_enriched = PosesFile.model_validate_json((run_dir / "poses_enriched.json").read_text(encoding="utf-8"))
         assert loaded_enriched == poses_enriched
 
+
+
+class TestFrameIdJoinSafety:
+    """The numeric-suffix telemetry/GT join must reject ambiguous frame id sets."""
+
+    def test_numeric_suffix_round_trip(self) -> None:
+        from uav3d.telemetry.frame_ids import frame_prefix, numeric_suffix
+
+        assert numeric_suffix("zurich_000042") == 42
+        assert frame_prefix("zurich_000042") == "zurich"
+        assert numeric_suffix("no_suffix_here") is None
+
+    def test_unique_mapping_is_returned(self) -> None:
+        from uav3d.telemetry.frame_ids import validate_frame_id_mapping
+
+        mapping = validate_frame_id_mapping(["zurich_000000", "zurich_000004"], context="test")
+        assert mapping == {0: "zurich_000000", 4: "zurich_000004"}
+
+    def test_duplicate_numeric_ids_are_rejected(self) -> None:
+        from uav3d.exceptions import DataError
+        from uav3d.telemetry.frame_ids import validate_frame_id_mapping
+
+        with pytest.raises(DataError, match="both map to telemetry id 12"):
+            validate_frame_id_mapping(["left_000012", "right_000012"], context="test")
+
+    def test_mixed_prefixes_are_rejected(self) -> None:
+        from uav3d.exceptions import DataError
+        from uav3d.telemetry.frame_ids import validate_frame_id_mapping
+
+        with pytest.raises(DataError, match="mixed frame id prefixes"):
+            validate_frame_id_mapping(["zurich_000000", "video_000001"], context="test")
+
+    def test_missing_suffix_is_rejected(self) -> None:
+        from uav3d.exceptions import DataError
+        from uav3d.telemetry.frame_ids import validate_frame_id_mapping
+
+        with pytest.raises(DataError, match="no numeric suffix"):
+            validate_frame_id_mapping(["zurich_frame"], context="test")

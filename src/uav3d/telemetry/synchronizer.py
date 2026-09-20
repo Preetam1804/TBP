@@ -10,16 +10,17 @@ Provides two distinct synchronization modes:
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
 from uav3d.config import SyncConfig
-from uav3d.exceptions import DataError, Uav3dError
 from uav3d.models.keyframes import KeyframeRecord, KeyframesFile
 from uav3d.models.poses import PoseRecord, PosesFile
 from uav3d.models.telemetry import TelemetryFile, TelemetryRecord
+from uav3d.telemetry.frame_ids import numeric_suffix, validate_frame_id_mapping
 from uav3d.telemetry.zurich_parser import ZurichGpsRecord, parse_onboard_gps
 
 logger = logging.getLogger("uav3d.telemetry.synchronizer")
@@ -40,7 +41,9 @@ def haversine_distance_m(lat1: float, lon1: float, alt1: float | None, lat2: flo
 
 def recommend_crs(latitudes: Sequence[float], longitudes: Sequence[float]) -> str:
     """Compute recommended CRS (UTM zone or local ENU) via pyproj from coordinate centroid."""
-    valid_coords = [(lat, lon) for lat, lon in zip(latitudes, longitudes) if lat is not None and lon is not None]
+    valid_coords = [
+        (lat, lon) for lat, lon in zip(latitudes, longitudes, strict=False) if lat is not None and lon is not None
+    ]
     if not valid_coords:
         return "local ENU (no GPS coordinates available)"
 
@@ -155,9 +158,7 @@ class TelemetrySynchronizer:
         else:
             # Auto-detect from frame IDs
             sample_ids = [p.frame_id for p in poses.poses[:5]]
-            if any(fid.startswith("zurich_") for fid in sample_ids):
-                is_zurich = True
-            elif sample_ids and re.search(r"(\d+)$", sample_ids[0]):
+            if any(fid.startswith("zurich_") for fid in sample_ids) or (sample_ids and re.search(r"(\d+)$", sample_ids[0])):
                 is_zurich = True
 
         if is_zurich:
@@ -205,15 +206,13 @@ class TelemetrySynchronizer:
         enriched_poses: list[PoseRecord] = []
         matched_count = 0
 
-        # Pattern for numeric frame ID extraction
-        num_pattern = re.compile(r"(\d+)$")
-
-        # Join on source_image_id
+        # Join on source_image_id; validate the numeric-suffix mapping before using it.
+        id_mapping = validate_frame_id_mapping(
+            [pose.frame_id for pose in poses.poses], context="telemetry synchronization"
+        )
         for pose in poses.poses:
             fid = pose.frame_id
-            match = num_pattern.search(fid)
-            num_id = int(match.group(1)) if match else None
-
+            num_id = numeric_suffix(fid)
             gps_entry = gps_by_id.get(num_id) if num_id is not None else None
 
             if gps_entry is not None:
@@ -247,11 +246,17 @@ class TelemetrySynchronizer:
             p_dict["telemetry_recorded"] = has_gps
             enriched_poses.append(PoseRecord(**p_dict))
 
-        # Check for unregistered frames if any, also include in telemetry mapping
-        for unreg in poses.unregistered_frames:
-            unreg_fid = unreg.frame_id if hasattr(unreg, "frame_id") else str(unreg)
-            match = num_pattern.search(unreg_fid)
-            num_id = int(match.group(1)) if match else None
+        # Check for unregistered frames if any, also include in telemetry mapping.
+        # Their ids participate in the same validated mapping as registered frames.
+        unregistered_fids = [
+            unreg.frame_id if hasattr(unreg, "frame_id") else str(unreg) for unreg in poses.unregistered_frames
+        ]
+        if unregistered_fids:
+            validate_frame_id_mapping(
+                [*id_mapping.values(), *unregistered_fids], context="telemetry synchronization (unregistered frames)"
+            )
+        for unreg_fid in unregistered_fids:
+            num_id = numeric_suffix(unreg_fid)
             gps_entry = gps_by_id.get(num_id) if num_id is not None else None
             if gps_entry is not None:
                 telemetry_records.append(
@@ -412,7 +417,7 @@ class TelemetrySynchronizer:
 
         enriched_poses: list[PoseRecord] = []
 
-        for pose, s_ts in zip(frame_poses, shifted_frame_ts):
+        for pose, s_ts in zip(frame_poses, shifted_frame_ts, strict=True):
             idx = int(np.argmin(np.abs(tel_ts - s_ts)))
             residual = int(tel_ts[idx] - s_ts)
 
@@ -552,13 +557,14 @@ class TelemetrySynchronizer:
         enriched_poses: list[PoseRecord] = []
         matched_count = 0
 
+        validate_frame_id_mapping([pose.frame_id for pose in poses.poses], context="manifest synchronization")
         for pose in poses.poses:
             fid = pose.frame_id
             entry = manifest_by_fid.get(fid)
             if entry is None:
-                match = re.search(r"(\d+)$", fid)
-                if match:
-                    entry = manifest_by_idx.get(int(match.group(1)))
+                num_id = numeric_suffix(fid)
+                if num_id is not None:
+                    entry = manifest_by_idx.get(num_id)
 
             p_dict = pose.model_dump()
             if entry:

@@ -1,6 +1,7 @@
 """Scratch script to inspect installed pycolmap API signatures and attributes."""
 
-import inspect
+import contextlib
+
 import pycolmap
 
 print("=== pycolmap version ===")
@@ -11,10 +12,8 @@ for fn_name in ["extract_features", "match_sequential", "incremental_mapping"]:
     if hasattr(pycolmap, fn_name):
         fn = getattr(pycolmap, fn_name)
         print(f"{fn_name}: {fn}")
-        try:
+        with contextlib.suppress(Exception):
             print(f"  doc: {fn.__doc__}")
-        except Exception:
-            pass
     else:
         print(f"{fn_name}: NOT FOUND")
 

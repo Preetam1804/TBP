@@ -1,21 +1,16 @@
 """Tests for SfM export, conventions, locked intrinsics, and unregistered frame handling."""
 
-import json
 from pathlib import Path
 
 import numpy as np
-import pycolmap
 import pytest
 
-from uav3d.config import SfmConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.models.frames import CameraCalibration
 from uav3d.models.poses import PosesFile
 from uav3d.sfm.colmap_compat import (
     compute_camera_center,
     get_peak_rss_mb,
-    get_pose_components,
-    is_image_registered,
     quaternion_to_rotation_matrix,
 )
 from uav3d.sfm.colmap_export import export_poses

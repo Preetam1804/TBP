@@ -14,7 +14,7 @@ from uav3d.config import KeyframeConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.quality import FrameQualityMetrics, compute_frame_quality
 from uav3d.models.frames import FrameRecord
-from uav3d.models.keyframes import KeyframeRecord, KeyframesFile
+from uav3d.models.keyframes import KeyframeRecord, KeyframeSelectionMeta, KeyframesFile
 from uav3d.sources.base import ImageSource
 
 logger = logging.getLogger("uav3d.keyframes.selector")
@@ -40,6 +40,10 @@ class SelectionSummary:
     final_stride: int
     stride_reductions: int
     blur_dist: MetricDistribution
+    effective_min_blur: float
+    min_blur_mode: str
+    rejected_by_blur: int
+    rejected_by_clipping: int
     brightness_dist: MetricDistribution
     clipping_dist: MetricDistribution
     features_dist: MetricDistribution
@@ -56,6 +60,8 @@ class KeyframeSelector:
         self.initial_stride = config.stride
         self.max_frames = config.max_frames
         self.min_blur = config.min_blur
+        self.min_blur_mode = config.min_blur_mode
+        self.blur_percentile = config.blur_percentile
         self.max_clipping = config.max_clipping
         self.max_gap = config.max_gap
         self.orb_features = config.orb_features
@@ -139,19 +145,17 @@ class KeyframeSelector:
         )
 
         if is_video_source:
-            video_file = str(getattr(source, "video_path", first_frame_path))
-            cap = cv2.VideoCapture(video_file)
-            try:
-                frame_idx = 0
-                while cap.isOpened() and frame_idx < total_frames:
-                    ret, bgr = cap.read()
-                    if not ret or bgr is None:
-                        decode_failed_count += 1
-                        frame_idx += 1
-                        continue
+            # Decode metrics only for the frames the source selected (not the whole video).
+            records_by_index = {
+                int(re.search(r"(\d+)$", frame.frame_id).group(1)): frame for frame in frames
+            }
+            decoded: set[str] = set()
+            if hasattr(source, "iter_frames_with_pixels"):
+                decoded_indices = sorted(records_by_index)
+                for record, bgr in source.iter_frames_with_pixels(decoded_indices):
                     metrics = compute_frame_quality(bgr, orb_features=self.orb_features)
-                    fid = frames[frame_idx].frame_id
-                    metrics_cache[fid] = metrics
+                    metrics_cache[record.frame_id] = metrics
+                    decoded.add(record.frame_id)
                     if metrics is None:
                         decode_failed_count += 1
                     else:
@@ -159,9 +163,28 @@ class KeyframeSelector:
                         all_brightness.append(metrics.brightness_mean)
                         all_clipping.append(metrics.clipping_ratio)
                         all_features.append(float(metrics.feature_count))
-                    frame_idx += 1
-            finally:
-                cap.release()
+            else:  # pragma: no cover - protocol fallback for non-video helpers
+                cap = cv2.VideoCapture(str(getattr(source, "video_path", first_frame_path)))
+                try:
+                    for idx in sorted(records_by_index):
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        ret, bgr = cap.read()
+                        fid = records_by_index[idx].frame_id
+                        metrics = compute_frame_quality(bgr, orb_features=self.orb_features) if ret else None
+                        metrics_cache[fid] = metrics
+                        decoded.add(fid)
+                        if metrics is None:
+                            decode_failed_count += 1
+                        else:
+                            all_blur_scores.append(metrics.blur_score)
+                            all_brightness.append(metrics.brightness_mean)
+                            all_clipping.append(metrics.clipping_ratio)
+                            all_features.append(float(metrics.feature_count))
+                finally:
+                    cap.release()
+
+            # Frames the source could not deliver are counted once (they were never decoded).
+            decode_failed_count += sum(1 for frame in frames if frame.frame_id not in decoded)
         else:
             for frame in frames:
                 img_path = self._resolve_image_path(frame, source)
@@ -174,6 +197,25 @@ class KeyframeSelector:
                     all_brightness.append(metrics.brightness_mean)
                     all_clipping.append(metrics.clipping_ratio)
                     all_features.append(float(metrics.feature_count))
+
+        # 2b. Resolve the effective blur gate.
+        # Absolute thresholds are imagery- and resolution-dependent (the metrics are computed on a
+        # grayscale frame resized to a fixed analysis width), so "adaptive" mode gates on the
+        # observed distribution instead of a constant that was tuned on other imagery.
+        analyzed_blurs = [m.blur_score for m in metrics_cache.values() if m is not None]
+        if self.min_blur_mode == "adaptive" and analyzed_blurs:
+            effective_min_blur = float(np.percentile(analyzed_blurs, self.blur_percentile))
+            logger.info(
+                f"Adaptive blur gate: p{self.blur_percentile:g} of {len(analyzed_blurs)} analysed frames "
+                f"= {effective_min_blur:.2f} (absolute min_blur={self.min_blur:.2f} not applied)"
+            )
+        else:
+            if self.min_blur_mode == "adaptive":
+                logger.warning("Adaptive blur gate requested but no frames could be analysed; using absolute min_blur")
+            effective_min_blur = self.min_blur
+
+        rejected_blur = 0
+        rejected_clipping = 0
 
         # 3. Iterative selection with Overlap Guard
         current_stride = self.initial_stride
@@ -194,10 +236,12 @@ class KeyframeSelector:
                 if metrics is None:
                     continue
 
-                # Quality gates
-                if metrics.blur_score < self.min_blur:
+                # Quality gates (diagnostics collected so a mis-calibrated threshold is visible)
+                if metrics.blur_score < effective_min_blur:
+                    rejected_blur += 1
                     continue
                 if metrics.clipping_ratio > self.max_clipping:
+                    rejected_clipping += 1
                     continue
 
                 candidate_indices.append(idx)
@@ -239,11 +283,20 @@ class KeyframeSelector:
             selected_records = candidate_records
             break
 
-        # 4. Cap at max_frames
+        # 4. Cap at max_frames by uniform subsampling.
+        # Truncating the tail would silently cover only the beginning of the flight and hand
+        # SfM/ATE a partial trajectory while still reporting a full-run KPI.
+        cap_applied_by_subsampling = False
         if len(selected_records) > self.max_frames:
-            logger.info(f"Capping selected keyframes from {len(selected_records)} to max_frames={self.max_frames}")
-            selected_records = selected_records[: self.max_frames]
-            selected_indices = selected_indices[: self.max_frames]
+            cap_applied_by_subsampling = True
+            keep = np.linspace(0, len(selected_records) - 1, self.max_frames).round().astype(int)
+            keep = np.unique(keep)  # defensive: guarantee strictly increasing, unique source indices
+            logger.info(
+                f"Subsampling {len(selected_records)} candidate keyframes to max_frames={self.max_frames} "
+                f"(covering frame ids {selected_records[keep[0]].frame_id} .. {selected_records[keep[-1]].frame_id})"
+            )
+            selected_records = [selected_records[i] for i in keep]
+            selected_indices = [selected_indices[i] for i in keep]
 
         logger.info(
             f"Selection completed: {len(selected_records)}/{total_frames} frames selected "
@@ -254,6 +307,21 @@ class KeyframeSelector:
         keyframes_file = KeyframesFile(
             schema_version="1.0.0",
             dataset_label=dataset_label,
+            selection=KeyframeSelectionMeta(
+                considered_count=total_frames,
+                selected_count=len(selected_records),
+                initial_stride=self.initial_stride,
+                final_stride=current_stride,
+                min_blur_mode=self.min_blur_mode,
+                effective_min_blur=round(float(effective_min_blur), 4),
+                max_clipping=float(self.max_clipping),
+                max_gap=int(self.max_gap),
+                rejected_by_blur=rejected_blur,
+                rejected_by_clipping=rejected_clipping,
+                decode_failed_count=decode_failed_count,
+                max_frames=int(self.max_frames),
+                cap_applied_by_subsampling=cap_applied_by_subsampling,
+            ),
             keyframes=selected_records,
         )
         json_path = run_dir / "keyframes.json"
@@ -262,23 +330,27 @@ class KeyframeSelector:
 
         # 6. Save selected keyframes to sfm/images/{frame_id}.jpg
         if is_video_source:
-            video_file = str(getattr(source, "video_path", first_frame_path))
-            cap = cv2.VideoCapture(video_file)
-            try:
-                for rec in selected_records:
-                    match = re.search(r"(\d+)$", rec.frame_id)
-                    if not match:
-                        continue
-                    idx = int(match.group(1))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, bgr = cap.read()
-                    dest_path = sfm_images_dir / f"{rec.frame_id}.jpg"
-                    if ret and bgr is not None:
-                        cv2.imwrite(str(dest_path), bgr)
-                    else:
-                        logger.warning(f"Failed to read frame index {idx} from video {video_file}")
-            finally:
-                cap.release()
+            # Single sequential decode pass over the selected keyframes only.
+            indices = [idx for rec in selected_records if (match := re.search(r"(\d+)$", rec.frame_id)) for idx in [int(match.group(1))]]
+            index_to_record = {int(re.search(r"(\d+)$", rec.frame_id).group(1)): rec for rec in selected_records}
+            if hasattr(source, "iter_frames_with_pixels"):
+                for record, bgr in source.iter_frames_with_pixels(indices):
+                    dest_path = sfm_images_dir / f"{record.frame_id}.jpg"
+                    cv2.imwrite(str(dest_path), bgr)
+            else:  # pragma: no cover - protocol fallback for non-video helpers
+                video_file = str(getattr(source, "video_path", first_frame_path))
+                cap = cv2.VideoCapture(video_file)
+                try:
+                    for idx in indices:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                        ret, bgr = cap.read()
+                        dest_path = sfm_images_dir / f"{index_to_record[idx].frame_id}.jpg"
+                        if ret and bgr is not None:
+                            cv2.imwrite(str(dest_path), bgr)
+                        else:
+                            logger.warning(f"Failed to read frame index {idx} from video {video_file}")
+                finally:
+                    cap.release()
         else:
             for rec in selected_records:
                 # Find original frame path
@@ -295,12 +367,40 @@ class KeyframeSelector:
                 except (OSError, NotImplementedError):
                     shutil.copy2(orig_path, dest_path)
 
+        sel_blurs = [rec.metrics["blur_score"] for rec in selected_records if rec.metrics]
+
+        # 6b. Calibration diagnostics: a gate that rejects nothing (or nearly everything) is
+        # almost always a threshold carried over from different imagery / resolution.
+        gated_total = rejected_blur + rejected_clipping + len(selected_records)
+        if gated_total > 0:
+            rejected_fraction = (rejected_blur + rejected_clipping) / gated_total
+            logger.info(
+                f"Quality gates: rejected {rejected_blur} by blur (< {effective_min_blur:.2f}) and "
+                f"{rejected_clipping} by clipping (> {self.max_clipping:.3f}); "
+                f"kept {len(selected_records)}"
+            )
+            if rejected_blur == 0 and self.min_blur_mode == "adaptive":
+                logger.warning(
+                    "Adaptive blur gate rejected no frames; the observed blur distribution may be "
+                    "too narrow for percentile gating"
+                )
+            elif rejected_blur == 0 and selected_records:
+                logger.warning(
+                    f"min_blur={self.min_blur:.2f} rejected no frames "
+                    f"(selected blur median {self._calc_distribution(sel_blurs).median_val:.2f}); it is likely "
+                    "calibrated for different imagery or a different analysis width"
+                )
+            elif rejected_fraction > 0.5:
+                logger.warning(
+                    f"Quality gates rejected {rejected_fraction * 100:.0f}% of candidates "
+                    f"(blur gate {effective_min_blur:.2f}); check min_blur/max_clipping for this dataset"
+                )
+
         # 7. Generate contact sheet
         contact_sheet_path = debug_dir / "contact_sheet.jpg"
         self._generate_contact_sheet(selected_records, sfm_images_dir, contact_sheet_path)
 
         # Distributions of selected frames
-        sel_blurs = [rec.metrics["blur_score"] for rec in selected_records if rec.metrics]
         sel_bright = [rec.metrics["brightness_mean"] for rec in selected_records if rec.metrics]
         sel_clip = [rec.metrics["clipping_ratio"] for rec in selected_records if rec.metrics]
         sel_feats = [rec.metrics["feature_count"] for rec in selected_records if rec.metrics]
@@ -313,6 +413,10 @@ class KeyframeSelector:
             final_stride=current_stride,
             stride_reductions=stride_reductions,
             blur_dist=self._calc_distribution(sel_blurs or all_blur_scores),
+            effective_min_blur=round(effective_min_blur, 4),
+            min_blur_mode=self.min_blur_mode,
+            rejected_by_blur=rejected_blur,
+            rejected_by_clipping=rejected_clipping,
             brightness_dist=self._calc_distribution(sel_bright or all_brightness),
             clipping_dist=self._calc_distribution(sel_clip or all_clipping),
             features_dist=self._calc_distribution(sel_feats or all_features),

@@ -142,6 +142,17 @@ def generate_validation_plots(
     return plot_paths
 
 
+def _read_json_if_present(path: Path) -> dict | None:
+    """Load a JSON artifact from a run directory, returning None when absent or unreadable."""
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Could not read {path}: {exc}")
+        return None
+
+
 def generate_sp1_report(
     run_dir: Path | str,
     report: AteReport,
@@ -166,12 +177,56 @@ def generate_sp1_report(
     reg_rate_str = f"{m.registration_rate * 100:.1f}%" if m.registration_rate is not None else "N/A"
     reproj_str = f"{m.mean_reprojection_error_px:.3f} px" if m.mean_reprojection_error_px is not None else "N/A"
 
-    kpi_reg_pass = m.registration_rate is not None and m.registration_rate >= 0.85
-    kpi_reproj_pass = m.mean_reprojection_error_px is not None and m.mean_reprojection_error_px <= 1.5
+    # --- Values taken from the run artifacts, never hardcoded -------------------------------
+    poses_data = _read_json_if_present(out_dir / "poses.json") or {}
+    keyframes_data = _read_json_if_present(out_dir / "keyframes.json") or {}
+    telemetry_data = _read_json_if_present(out_dir / "telemetry.json") or {}
+    sfm_metrics = poses_data.get("metrics") or {}
+    camera_block = poses_data.get("camera") or {}
+
+    num_total = int(sfm_metrics.get("num_images_total") or m.num_registered_frames)
+    num_registered = int(sfm_metrics.get("num_images_registered") or m.num_registered_frames)
+    num_dropped = max(0, num_total - num_registered)
+
+    camera_model = camera_block.get("model") or "unknown"
+    camera_params = camera_block.get("params") or []
+    camera_params_str = "[" + ", ".join(f"{float(v):.4g}" for v in camera_params) + "]" if camera_params else "N/A"
+    camera_resolution = (
+        f"{camera_block.get('width', '?')}x{camera_block.get('height', '?')}" if camera_block else "N/A"
+    )
+
+    keyframe_meta = keyframes_data.get("selection") or {}
+    stride_str = str(keyframe_meta.get("final_stride", config.keyframes.stride))
+    num_keyframes = len(keyframes_data.get("keyframes") or []) or num_total
+    min_blur_mode = keyframe_meta.get("min_blur_mode", config.keyframes.min_blur_mode)
+    effective_min_blur = keyframe_meta.get("effective_min_blur", config.keyframes.min_blur)
+
+    crs_label = (
+        telemetry_data.get("crs_recommendation")
+        or telemetry_data.get("recommended_crs")
+        or (telemetry_data.get("sync") or {}).get("crs_recommendation")
+        or "not computed"
+    )
+    sync_status = (
+        telemetry_data.get("sync_status")
+        or (telemetry_data.get("sync") or {}).get("sync_status")
+        or "N/A"
+    )
+    telemetry_records = telemetry_data.get("records") or telemetry_data.get("telemetry") or []
+    telemetry_matched = len(telemetry_records)
+
+    # --- KPI thresholds come from the configuration actually used --------------------------
+    reg_target = config.validation.min_registration_rate
+    reproj_target = config.validation.max_reprojection_error_px
+    ate_target = config.validation.ate_threshold_meters
+
+    kpi_reg_pass = m.registration_rate is not None and m.registration_rate >= reg_target
+    kpi_reproj_pass = m.mean_reprojection_error_px is not None and m.mean_reprojection_error_px <= reproj_target
+    kpi_ate_pass = m.rmse_m <= ate_target
 
     content = f"""# SP-1 Metrics & Trajectory Validation Report
 
-> **Dataset Provenance**: `{report.dataset_label}`  
+> **Dataset Provenance**: `{report.dataset_label}`
 > **Evaluation Mode**: Ground Truth consumed exclusively for post-reconstruction validation. Never consumed by visual SfM or keyframing stages.
 
 ---
@@ -180,9 +235,9 @@ def generate_sp1_report(
 
 | Primary Metric / KPI | Benchmark Target | Achieved Pipeline Value | Status |
 | :--- | :--- | :--- | :--- |
-| **SfM Keyframe Registration Rate** | $\\ge 85.0\\%$ | **{reg_rate_str}** ({m.num_registered_frames}/{m.num_registered_frames}) | {'**PASSED**' if kpi_reg_pass else '**FAILED**'} |
-| **Mean Reprojection Error** | $\\le 1.500\\text{{ px}}$ | **{reproj_str}** | {'**PASSED**' if kpi_reproj_pass else '**FAILED**'} |
-| **Absolute Trajectory Error (RMSE)** | $\\le 5.000\\text{{ m}}$ | **{m.rmse_m:.3f} m** | **PASSED** |
+| **SfM Keyframe Registration Rate** | $\\ge {reg_target * 100:.1f}\\%$ | **{reg_rate_str}** ({num_registered}/{num_total}) | {'**PASSED**' if kpi_reg_pass else '**FAILED**'} |
+| **Mean Reprojection Error** | $\\le {reproj_target:.3f}\\text{{ px}}$ | **{reproj_str}** | {'**PASSED**' if kpi_reproj_pass else '**FAILED**'} |
+| **Absolute Trajectory Error (RMSE)** | $\\le {ate_target:.3f}\\text{{ m}}$ | **{m.rmse_m:.3f} m** | {'**PASSED**' if kpi_ate_pass else '**FAILED**'} |
 | **Sim(3) Alignment Condition** | `well_conditioned` | **{m.fit_condition}** | {'Normal' if m.fit_condition == 'well_conditioned' else 'Warning (Collinear corridor)'} |
 
 ---
@@ -223,9 +278,9 @@ Similarity transformation optimal parameters ($C_{{gt}} \\approx s \\cdot R \\cd
 | Stage | Key Operations & Parameters | Artifacts Produced |
 | :--- | :--- | :--- |
 | **Phase 1: Ingestion** | Zurich image sequence, discrete timestamp mapping | `SourceMetadata`, verified calibration |
-| **Phase 2: Keyframing** | Laplacian variance quality gate, overlap guard (stride=2) | `keyframes.json`, `sfm/images/`, `contact_sheet.jpg` |
-| **Phase 3: Visual SfM** | pycolmap 3.12 incremental mapping, locked intrinsics (`OPENCV`), sequential matching | `poses.json`, `database.db`, `sparse/0/` |
-| **Phase 4: Telemetry Sync** | Exact image ID join (Mode A), `pyproj` CRS recommendation | `telemetry.json`, `poses_enriched.json` |
+| **Phase 2: Keyframing** | Laplacian variance quality gate ({min_blur_mode}, threshold {effective_min_blur:g}), overlap guard (stride={stride_str}) | `keyframes.json` ({num_keyframes} keyframes), `sfm/images/`, `contact_sheet.jpg` |
+| **Phase 3: Visual SfM** | pycolmap incremental mapping, `{camera_model}` intrinsics {camera_params_str} at {camera_resolution} ({'locked' if not config.sfm.refine_intrinsics else 'refined'}), sequential matching | `poses.json`, `database.db`, `sparse/0/` |
+| **Phase 4: Telemetry Sync** | Source-image-id join (status `{sync_status}`), `{telemetry_matched}` telemetry records, CRS `{crs_label}` | `telemetry.json`, `poses_enriched.json` |
 | **Phase 5: Validation** | 7-DoF Umeyama alignment, PCA flightline condition check | `ate_report.json`, plots, `SP1_REPORT.md` |
 
 ---
@@ -241,7 +296,7 @@ Similarity transformation optimal parameters ($C_{{gt}} \\approx s \\cdot R \\cd
 4. **Flightline Collinearity**:
    - As flagged by the fit condition check (`{m.fit_condition}`), linear flight trajectories exhibit small cross-track dispersion, making rotation about the primary flight vector ill-conditioned. The Umeyama alignment reports the global least-squares fit across the corridor.
 5. **Unregistered Frames**:
-   - 0 frames dropped ({m.num_registered_frames}/{m.num_registered_frames} registered in largest model).
+   - {num_dropped} frame(s) dropped ({num_registered}/{num_total} registered in the largest model).
 
 ---
 
@@ -250,7 +305,7 @@ Similarity transformation optimal parameters ($C_{{gt}} \\approx s \\cdot R \\cd
 SP-1 deliverables are fully prepared for SP-2 (Monocular Depth & TSDF Fusion):
 - `sfm/images/`: Keyframe image directory ready for depth network batch inference.
 - `poses.json`: Verified camera trajectory ($C = -R^T t$, quaternion `wxyz`) and locked camera intrinsic block.
-- `telemetry.json`: Georeferenced WGS84 coordinates and recommended UTM CRS (`UTM zone 32N`).
+- `telemetry.json`: Georeferenced WGS84 coordinates and recommended CRS (`{crs_label}`).
 """
     report_file.write_text(content.strip() + "\n", encoding="utf-8")
     logger.info(f"Wrote SP-1 report to {report_file}")
