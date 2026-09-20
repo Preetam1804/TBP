@@ -6,11 +6,10 @@ Strictly consumes GroundTruthAGL for evaluation only. Never consumed by visual S
 import logging
 import re
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
-from uav3d.exceptions import DataError, Uav3dError
+from uav3d.exceptions import Uav3dError
 from uav3d.models.poses import PosesFile
 from uav3d.models.validation import AteMetrics, AteReport, PerFrameAte
 from uav3d.telemetry.zurich_parser import ZurichGroundTruthRecord, parse_ground_truth_agl
@@ -122,10 +121,7 @@ def check_flightline_geometry(gt_points: np.ndarray) -> tuple[str, dict[str, flo
 
     # If cross-track horizontal spread is < 5% of longitudinal flightline spread
     # or secondary eigenvalue is < 0.5 m^2 (sub-meter cross-track dispersion)
-    if aspect_ratio_21 < 0.05 or lam2 < 0.5:
-        condition = "weak_flightline_geometry"
-    else:
-        condition = "ok"
+    condition = "weak_flightline_geometry" if (aspect_ratio_21 < 0.05 or lam2 < 0.5) else "ok"
 
     stats = {
         "primary_eigenval": lam1,

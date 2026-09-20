@@ -82,7 +82,7 @@ def generate_zurich_sample_dataset(
             img[y, :, 2] = int(45 + 20 * (y / H))
 
         # Project 3D landmarks
-        for pt, pat in zip(pts3D, patterns):
+        for pt, pat in zip(pts3D, patterns, strict=True):
             p_c = R_cw @ pt + t_cw
             if p_c[2] > 2.0:
                 u = int(fx * p_c[0] / p_c[2] + cx)

@@ -307,6 +307,16 @@ class ZurichSequenceSource(ImageSource):
         return self._gt_records.get(int(match.group(1)))
 
     @property
+    def gps_records(self) -> dict[int, ZurichGpsRecord]:
+        """Onboard GPS telemetry keyed by dataset image id (public accessor)."""
+        return self._gps_records
+
+    @property
+    def ground_truth_records(self) -> dict[int, ZurichGroundTruthRecord]:
+        """Ground truth positions keyed by dataset image id (EVALUATION ONLY)."""
+        return self._gt_records
+
+    @property
     def total_gps_count(self) -> int:
         """Count of loaded GPS records."""
         return len(self._gps_records)

@@ -1,6 +1,9 @@
 """Tests for uav3d schemas, config loading, and CLI commands."""
 
+from pathlib import Path
+
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from uav3d.cli import main
@@ -137,8 +140,8 @@ class TestSchemaSerialization:
 class TestConfigLoading:
     """Verify configuration parsing, validation, and fail-fast behavior."""
 
-    def test_load_zurich_baseline(self) -> None:
-        cfg = load_config("configs/zurich_baseline.yaml")
+    def test_load_zurich_baseline(self, repo_root: Path) -> None:
+        cfg = load_config(repo_root / "configs" / "zurich_baseline.yaml")
         assert isinstance(cfg, PipelineConfig)
         assert "replayed public dataset" in cfg.dataset_label
         assert cfg.sfm.camera_model == "OPENCV"
@@ -173,9 +176,66 @@ class TestCliSmoke:
     def test_subcommand_help_exits_zero(self, subcommand: str) -> None:
         assert main([subcommand, "--help"]) == 0
 
+    def test_inspect_and_keyframes_on_fixture_dataset(
+        self, fake_zurich_dataset: Path, tmp_path: Path
+    ) -> None:
+        """Hermetic happy path: inspect + keyframes against a generated mini dataset."""
+        config_path = tmp_path / "smoke_config.yaml"
+        config_path.write_text(
+            yaml.dump(
+                {
+                    "data_dir": str(tmp_path),
+                    "dataset_label": "replayed public dataset",
+                    "source": {
+                        "type": "zurich",
+                        "dataset_dir": str(fake_zurich_dataset),
+                        "start_id": 0,
+                        "count": 5,
+                        "stride": 1,
+                    },
+                    "keyframes": {"stride": 1, "min_blur": 10.0, "max_clipping": 0.5, "max_gap": 15},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert main(["inspect", "--config", str(config_path)]) == 0
+        assert main(["keyframes", "--config", str(config_path)]) == 0
+
+
+class TestCliFailsLoudlyWithoutInputs:
+    """Every stage must exit non-zero with an actionable message when its inputs are absent."""
+
+    @pytest.fixture
+    def empty_config(self, tmp_path: Path) -> Path:
+        """Config pointing at a data root that contains no dataset and no runs."""
+        config_path = tmp_path / "empty_config.yaml"
+        config_path.write_text(
+            yaml.dump(
+                {
+                    "data_dir": str(tmp_path / "no_data"),
+                    "source": {
+                        "type": "zurich",
+                        "dataset_dir": str(tmp_path / "no_data" / "raw" / "zurich_mav"),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config_path
+
     @pytest.mark.parametrize("subcommand", ["inspect", "keyframes", "sfm", "sync", "validate"])
-    def test_subcommand_stub_execution(self, subcommand: str) -> None:
-        cmd = [subcommand, "--config", "configs/zurich_baseline.yaml"]
-        if subcommand in {"sync", "validate"}:
-            cmd.extend(["--run-dir", "data/outputs/run_20260914_112220"])
-        assert main(cmd) == 0
+    def test_missing_inputs_exit_nonzero_with_message(
+        self, subcommand: str, empty_config: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert main([subcommand, "--config", str(empty_config)]) == 1
+        captured = capsys.readouterr()
+        assert "Error" in captured.err
+
+    def test_missing_config_file_is_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """An explicitly requested config that does not exist must fail, never silently default."""
+        missing = tmp_path / "does_not_exist.yaml"
+        assert main(["inspect", "--config", str(missing)]) == 1
+        captured = capsys.readouterr()
+        assert "Configuration file not found" in captured.err
+        assert str(missing) in captured.err

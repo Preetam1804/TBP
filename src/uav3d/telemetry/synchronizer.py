@@ -10,13 +10,13 @@ Provides two distinct synchronization modes:
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
 from uav3d.config import SyncConfig
-from uav3d.exceptions import DataError, Uav3dError
 from uav3d.models.keyframes import KeyframeRecord, KeyframesFile
 from uav3d.models.poses import PoseRecord, PosesFile
 from uav3d.models.telemetry import TelemetryFile, TelemetryRecord
@@ -40,7 +40,9 @@ def haversine_distance_m(lat1: float, lon1: float, alt1: float | None, lat2: flo
 
 def recommend_crs(latitudes: Sequence[float], longitudes: Sequence[float]) -> str:
     """Compute recommended CRS (UTM zone or local ENU) via pyproj from coordinate centroid."""
-    valid_coords = [(lat, lon) for lat, lon in zip(latitudes, longitudes) if lat is not None and lon is not None]
+    valid_coords = [
+        (lat, lon) for lat, lon in zip(latitudes, longitudes, strict=False) if lat is not None and lon is not None
+    ]
     if not valid_coords:
         return "local ENU (no GPS coordinates available)"
 
@@ -155,9 +157,7 @@ class TelemetrySynchronizer:
         else:
             # Auto-detect from frame IDs
             sample_ids = [p.frame_id for p in poses.poses[:5]]
-            if any(fid.startswith("zurich_") for fid in sample_ids):
-                is_zurich = True
-            elif sample_ids and re.search(r"(\d+)$", sample_ids[0]):
+            if any(fid.startswith("zurich_") for fid in sample_ids) or (sample_ids and re.search(r"(\d+)$", sample_ids[0])):
                 is_zurich = True
 
         if is_zurich:
@@ -412,7 +412,7 @@ class TelemetrySynchronizer:
 
         enriched_poses: list[PoseRecord] = []
 
-        for pose, s_ts in zip(frame_poses, shifted_frame_ts):
+        for pose, s_ts in zip(frame_poses, shifted_frame_ts, strict=True):
             idx = int(np.argmin(np.abs(tel_ts - s_ts)))
             residual = int(tel_ts[idx] - s_ts)
 

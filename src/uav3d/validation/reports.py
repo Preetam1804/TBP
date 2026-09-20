@@ -1,6 +1,5 @@
 """Report and visualization generators for SP-1 ATE validation."""
 
-import json
 import logging
 from pathlib import Path
 
@@ -171,7 +170,7 @@ def generate_sp1_report(
 
     content = f"""# SP-1 Metrics & Trajectory Validation Report
 
-> **Dataset Provenance**: `{report.dataset_label}`  
+> **Dataset Provenance**: `{report.dataset_label}`
 > **Evaluation Mode**: Ground Truth consumed exclusively for post-reconstruction validation. Never consumed by visual SfM or keyframing stages.
 
 ---

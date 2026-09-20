@@ -1,10 +1,30 @@
 """Pytest fixtures for Zurich dataset and synthetic video testing."""
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(scope="session")
+def repo_root() -> Path:
+    """Absolute path to the repository root (tests use repo-relative config paths)."""
+    return REPO_ROOT
+
+
+@pytest.fixture(autouse=True)
+def _run_from_repo_root(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run every test with CWD at the repository root.
+
+    The CLI resolves relative configuration/data paths against CWD, so the suite
+    must not depend on where pytest was invoked from.
+    """
+    monkeypatch.chdir(REPO_ROOT)
+    yield
 
 
 @pytest.fixture

@@ -78,7 +78,7 @@ class TestUmeyamaAlignment:
         Y = X.copy()
         Y[:, 2] = -Y[:, 2]
 
-        s_rec, R_rec, t_rec, aligned_rec = umeyama_alignment(X, Y)
+        _s_rec, R_rec, _t_rec, _aligned_rec = umeyama_alignment(X, Y)
 
         det_R = np.linalg.det(R_rec)
         assert np.isclose(det_R, 1.0, atol=1e-5), f"Reflection guard failed: det(R) = {det_R}"
@@ -101,9 +101,9 @@ class TestUmeyamaAlignment:
         noise = np.random.normal(0.0, 0.05, size=X.shape)
         Y = true_scale * (X @ true_rot.T) + true_trans + noise
 
-        s_rec, R_rec, t_rec, aligned_rec = umeyama_alignment(X, Y)
+        _s_rec, _R_rec, _t_rec, aligned_rec = umeyama_alignment(X, Y)
 
-        assert abs(s_rec - true_scale) / true_scale < 0.03, f"Recovered scale {s_rec} deviated >3%"
+        assert abs(_s_rec - true_scale) / true_scale < 0.03, f"Recovered scale {_s_rec} deviated >3%"
         errors = np.linalg.norm(aligned_rec - Y, axis=1)
         rmse = float(np.sqrt(np.mean(errors**2)))
         median = float(np.median(errors))

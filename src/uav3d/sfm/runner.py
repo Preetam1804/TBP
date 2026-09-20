@@ -4,7 +4,6 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pycolmap
@@ -88,7 +87,7 @@ class SfmRunner:
 
         # Discover image files (deduplicated to prevent duplicate entries on Windows)
         image_files = sorted(
-            list({p.name for p in img_path.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}})
+            {p.name for p in img_path.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}}
         )
         total_images = len(image_files)
         if total_images == 0:
@@ -277,9 +276,8 @@ class SfmRunner:
                 f"(expected: {expected_params.tolist()})"
             )
 
-            if not self.config.refine_intrinsics:
-                if not np.allclose(actual_params, expected_params, atol=1e-3):
-                    raise Uav3dError(
+            if not self.config.refine_intrinsics and not np.allclose(actual_params, expected_params, atol=1e-3):
+                raise Uav3dError(
                         f"Camera intrinsics were modified during bundle adjustment despite refine_intrinsics=False! "
                         f"Expected: {expected_params.tolist()}, Got: {actual_params.tolist()}"
                     )

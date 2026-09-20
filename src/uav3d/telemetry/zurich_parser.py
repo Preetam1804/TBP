@@ -54,7 +54,7 @@ def parse_onboard_gps(csv_path: Path | str) -> tuple[dict[int, ZurichGpsRecord],
     records: dict[int, ZurichGpsRecord] = {}
     skipped_count = 0
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
         try:
             header = next(reader)
@@ -178,7 +178,7 @@ def parse_ground_truth_agl(csv_path: Path | str) -> tuple[dict[int, ZurichGround
     records: dict[int, ZurichGroundTruthRecord] = {}
     skipped_count = 0
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
         try:
             header = next(reader)

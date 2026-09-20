@@ -117,7 +117,7 @@ def load_config(path: str | Path | None = None) -> PipelineConfig:
         if not path_obj.exists():
             raise ConfigError(f"Configuration file not found: {path_obj}")
         try:
-            with open(path_obj, "r", encoding="utf-8") as f:
+            with open(path_obj, encoding="utf-8") as f:
                 loaded = yaml.safe_load(f)
                 if loaded is not None:
                     if not isinstance(loaded, dict):
