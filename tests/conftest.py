@@ -1,10 +1,34 @@
 """Pytest fixtures for Zurich dataset and synthetic video testing."""
 
+import importlib.util
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_parallax_module():
+    """Load scripts/make_parallax_video.py as a module (deterministic 3D-parallax video)."""
+    spec = importlib.util.spec_from_file_location(
+        "make_parallax_video", REPO_ROOT / "scripts" / "make_parallax_video.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["make_parallax_video"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def parallax_video(tmp_path: Path) -> Path:
+    """Deterministic 40-frame 320x240 synthetic video with true 3D parallax (SfM-ready)."""
+    mod = _load_parallax_module()
+    out = tmp_path / "parallax.mp4"
+    mod.make_parallax_video(out, frames=40, width=320, height=240, fps=10.0)
+    return out
 
 
 @pytest.fixture

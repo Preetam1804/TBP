@@ -38,6 +38,11 @@ sfm:
   init_min_inliers: 15
   init_min_tri_angle: 2.0
   abs_pose_min_inliers: 10
+  # Single-model mode: stop after the main reconstruction. Prevents the slow
+  # tail of "Discarding reconstruction due to insufficient size" attempts that
+  # COLMAP makes when multiple_models is left on (can burn hours on leftovers).
+  multiple_models: false
+  init_num_trials: 200
 
 sync:
   max_delta_us: 50000

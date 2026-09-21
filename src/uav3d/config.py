@@ -54,6 +54,20 @@ class SfmConfig(BaseModel):
     abs_pose_min_inliers: int = Field(default=10, ge=1, description="Minimum inliers for absolute pose registration")
     min_model_size: int = Field(default=3, ge=2, description="Minimum registered images to keep reconstruction")
     ignore_watermarks: bool = Field(default=True, description="Whether to ignore watermark detection in sequential matching")
+    multiple_models: bool = Field(
+        default=False,
+        description=(
+            "Whether COLMAP may attempt additional reconstructions from unregistered images after the "
+            "main model. Default False: stops after the largest model, avoiding the slow tail of "
+            "'Discarding reconstruction due to insufficient size' attempts on leftover frames."
+        ),
+    )
+    init_num_trials: int = Field(
+        default=200,
+        gt=0,
+        le=10000,
+        description="Maximum initialization pair trials per reconstruction attempt (COLMAP default 200).",
+    )
 
 
 class SyncConfig(BaseModel):
