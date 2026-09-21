@@ -9,6 +9,7 @@ from uav3d.models.poses import (
     SfmMetrics,
     UnregisteredFrameRecord,
 )
+from uav3d.models.reconstruction import ReconstructionSummary
 from uav3d.models.telemetry import TelemetryFile, TelemetryRecord
 from uav3d.models.validation import AteMetrics, AteReport, PerFrameAte
 
@@ -22,6 +23,7 @@ __all__ = [
     "PerFrameAte",
     "PoseRecord",
     "PosesFile",
+    "ReconstructionSummary",
     "SfmCameraBlock",
     "SfmMetrics",
     "TelemetryFile",

@@ -154,3 +154,57 @@ SP-2 handoff: depth (SP-2 consumes poses.json + keyframes.json).
 <none>
 ### Next Actions
 Bug-fix buffer / capture-guidance notes; then SP-2 Phase A (DepthAnything-V2-Small).
+
+## SP-1.5 Completed: 2026-09-21 — Single-pass `reconstruct` + COLMAP hang fix
+### Completed
+- New `uav3d reconstruct` subcommand: video → keyframes → SfM → 3D model in one pass.
+  Video-only input (`--video`; no telemetry/GT). Auto PINHOLE intrinsics
+  (fx=fy=0.9*width, overridable via --calibration-file). Sync/ATE stages skip cleanly (INFO).
+- Fix for the ~2.5 h hang on the user's field video:
+  * `sfm.multiple_models: false` (new default) — COLMAP stops after the main
+    reconstruction instead of burning hours re-attempting secondary-model
+    initialization over leftover frames ("Discarding reconstruction due to
+    insufficient size" tail eliminated; verified 0 discard lines in native log).
+  * `sfm.init_num_trials: 200` (new, pipeline-level) caps init attempts.
+  * `--max-frames N` is a hard budget: ceil pre-stride before quality evaluation,
+    enforced in both `keyframes` and `reconstruct`.
+- Native COLMAP glog (fd 2) captured to `colmap_native.log` via fd-2 redirect
+  (sfm/native_log.py). Env-var log control (GOOGLE_LOG_LEVEL) verified NOT to work
+  on pycolmap 3.12.6; Python logging unaffected.
+- 3D model export: model.ply (colored points), model/ (COLMAP text model),
+  trajectory.ply (camera path, vertices+edges, frame-id order),
+  reconstruction_summary.json (versioned manifest, schema 1.0.0).
+### Files Created
+modeling/{__init__,export}.py, models/reconstruction.py, sfm/native_log.py,
+tests/test_reconstruct.py (6 tests)
+### Files Modified
+cli.py (reconstruct subcommand/handler; --max-frames on keyframes;
+_resolve_calibration/_find_ground_truth helpers), sfm/runner.py (option plumbing +
+native-log capture + default log path + 0-registered-frame diagnostics),
+keyframes/selector.py (frame_budget param + per-frame seek metrics),
+configs/zurich_baseline.yaml, tests/conftest.py (parallax_video fixture),
+tests/test_schemas.py (hermetic smoke runs; no developer data needed),
+tests/test_keyframes.py (missing `import pytest` — pre-existing NameError),
+README.md (usage).
+### Verification (sandbox, CPU only)
+uv run pytest: 72 passed, 3 skipped (all green).
+Live smoke: 60-frame 640x360 parallax video, --max-frames 60 →
+30/30 registered (100.0%), mean reproj 0.658 px, 180 3D points, 1 model,
+0 "discard" lines in colmap_native.log, wall 6.4 s, all artifacts present.
+### Decisions Made
+- multiple_models=False default; config-exposed for power users.
+- Trajectory PLY is a polyline (n vertices + n-1 edges) ordered by frame id,
+  not a point cloud.
+- MVS (patch_match_stereo) not wired: requires CUDA; dense mesh stays SP-2.
+- Budgeted keyframes too sparse for init → fail fast with actionable error
+  (no silent re-stride).
+### Known Limitations
+- Monocular scale unknown until metric alignment (documented in manifest).
+- Windows run: user's local copy has diverged (SP-2 depth stages); they must
+  run THIS branch for the fixes.
+### Remaining Tasks
+SP-2 (Depth Anything V2-Small) can consume poses.json + keyframes.json unchanged.
+### Current Blockers
+<none>
+### Next Actions
+Hand the exact command to the user; await real-video results.

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 import yaml
 
 from uav3d.cli import main

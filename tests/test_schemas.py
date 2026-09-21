@@ -1,5 +1,8 @@
 """Tests for uav3d schemas, config loading, and CLI commands."""
 
+import shutil
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -173,9 +176,51 @@ class TestCliSmoke:
     def test_subcommand_help_exits_zero(self, subcommand: str) -> None:
         assert main([subcommand, "--help"]) == 0
 
-    @pytest.mark.parametrize("subcommand", ["inspect", "keyframes", "sfm", "sync", "validate"])
-    def test_subcommand_stub_execution(self, subcommand: str) -> None:
-        cmd = [subcommand, "--config", "configs/zurich_baseline.yaml"]
+    @pytest.mark.parametrize("subcommand", ["inspect", "keyframes", "sfm", "sync", "validate", "reconstruct"])
+    def test_subcommand_stub_execution(
+        self,
+        subcommand: str,
+        tmp_path: Path,
+        fake_zurich_dataset: Path,
+        parallax_video: Path,
+    ) -> None:
+        """Smoke-run each subcommand hermetically (no developer-machine data required)."""
+        # With --data-dir, the data dir itself is the dataset root (see _build_source)
+        data_dir = tmp_path / "data"
+        shutil.copytree(fake_zurich_dataset, data_dir)
+
         if subcommand in {"sync", "validate"}:
-            cmd.extend(["--run-dir", "data/outputs/run_20260914_112220"])
-        assert main(cmd) == 0
+            # These require a completed SfM run directory. Only smoke-run against the
+            # developer's reference run when it exists in this checkout.
+            dev_run = Path("data/outputs/run_20260914_112220")
+            if not dev_run.exists():
+                pytest.skip("developer reference run dir not present in this checkout")
+            assert main([subcommand, "--config", "configs/zurich_baseline.yaml", "--run-dir", str(dev_run)]) == 0
+            return
+
+        if subcommand in {"inspect", "keyframes"}:
+            assert main([subcommand, "--config", "configs/zurich_baseline.yaml", "--data-dir", str(data_dir)]) == 0
+            return
+
+        if subcommand == "sfm":
+            # keyframes first (creates the run dir), then sfm on the parallax video
+            assert main(["keyframes", "--video", str(parallax_video), "--data-dir", str(data_dir)]) == 0
+            assert main(["sfm", "--video", str(parallax_video), "--data-dir", str(data_dir)]) == 0
+            return
+
+        if subcommand == "reconstruct":
+            assert (
+                main(
+                    [
+                        "reconstruct",
+                        "--video",
+                        str(parallax_video),
+                        "--data-dir",
+                        str(data_dir),
+                        "--max-frames",
+                        "20",
+                    ]
+                )
+                == 0
+            )
+            return

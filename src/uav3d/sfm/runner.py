@@ -4,7 +4,6 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pycolmap
@@ -13,6 +12,7 @@ from uav3d.config import SfmConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.models.frames import CameraCalibration
 from uav3d.sfm.colmap_compat import get_peak_rss_mb
+from uav3d.sfm.native_log import NativeStderrCapture
 
 logger = logging.getLogger("uav3d.sfm.runner")
 
@@ -54,6 +54,7 @@ class SfmRunner:
         images_dir: str | Path,
         output_dir: str | Path,
         calibration: CameraCalibration,
+        native_log_path: str | Path | None = None,
     ) -> SfmRunResult:
         """Run the complete incremental SfM pipeline.
 
@@ -67,10 +68,17 @@ class SfmRunner:
             images_dir: Directory containing input keyframe images.
             output_dir: Run directory (e.g. data/outputs/run_<timestamp>).
             calibration: Camera calibration containing known intrinsics.
+            native_log_path: Optional file path. When given, the raw C++ log
+                stream emitted by the pycolmap binary (glog lines such as
+                'Processed file [i/N]' or 'Discarding reconstruction ...') is
+                captured into this file instead of flooding the console.
 
         Returns:
             SfmRunResult containing selected reconstruction and profiling metrics.
         """
+        if native_log_path is None:
+            native_log_path = Path(output_dir) / "colmap_native.log"
+
         img_path = Path(images_dir).resolve()
         out_path = Path(output_dir).resolve()
 
@@ -87,9 +95,7 @@ class SfmRunner:
         sparse_dir.mkdir(parents=True, exist_ok=True)
 
         # Discover image files (deduplicated to prevent duplicate entries on Windows)
-        image_files = sorted(
-            list({p.name for p in img_path.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}})
-        )
+        image_files = sorted(p.name for p in img_path.iterdir() if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
         total_images = len(image_files)
         if total_images == 0:
             raise Uav3dError(f"No image files found in {img_path}")
@@ -113,18 +119,19 @@ class SfmRunner:
 
         camera_mode = pycolmap.CameraMode.SINGLE if self.config.single_camera else pycolmap.CameraMode.AUTO
 
-        try:
-            pycolmap.extract_features(
-                database_path=str(database_path),
-                image_path=str(img_path),
-                image_names=image_files,
-                camera_mode=camera_mode,
-                camera_model=self.config.camera_model,
-                reader_options=reader_opts,
-                sift_options=sift_opts,
-            )
-        except Exception as exc:
-            raise Uav3dError(f"Feature extraction failed: {exc}") from exc
+        with NativeStderrCapture(native_log_path):
+            try:
+                pycolmap.extract_features(
+                    database_path=str(database_path),
+                    image_path=str(img_path),
+                    image_names=image_files,
+                    camera_mode=camera_mode,
+                    camera_model=self.config.camera_model,
+                    reader_options=reader_opts,
+                    sift_options=sift_opts,
+                )
+            except Exception as exc:
+                raise Uav3dError(f"Feature extraction failed: {exc}") from exc
 
         profiles.append(
             SfmStageProfile(
@@ -139,28 +146,29 @@ class SfmRunner:
         # -------------------------------------------------------------
         t0 = time.perf_counter()
         logger.info("Stage 2/4: Injecting known camera calibration into database")
-        db = pycolmap.Database()
-        db.open(str(database_path))
+        with NativeStderrCapture(native_log_path):
+            db = pycolmap.Database()
+            db.open(str(database_path))
 
-        db_cams = db.read_all_cameras()
-        if not db_cams:
-            logger.info("No cameras found in DB; creating camera record with injected intrinsics")
-            new_cam = pycolmap.Camera(
-                model=self.config.camera_model,
-                width=calibration.width,
-                height=calibration.height,
-                params=calibration.params,
-            )
-            db.write_camera(new_cam)
-        else:
-            for cam in db_cams:
-                cam.params = np.array(calibration.params, dtype=np.float64)
-                cam.width = calibration.width
-                cam.height = calibration.height
-                db.update_camera(cam)
-            logger.info(f"Updated {len(db_cams)} database camera record(s) with injected intrinsics: {calibration.params}")
+            db_cams = db.read_all_cameras()
+            if not db_cams:
+                logger.info("No cameras found in DB; creating camera record with injected intrinsics")
+                new_cam = pycolmap.Camera(
+                    model=self.config.camera_model,
+                    width=calibration.width,
+                    height=calibration.height,
+                    params=calibration.params,
+                )
+                db.write_camera(new_cam)
+            else:
+                for cam in db_cams:
+                    cam.params = np.array(calibration.params, dtype=np.float64)
+                    cam.width = calibration.width
+                    cam.height = calibration.height
+                    db.update_camera(cam)
+                logger.info(f"Updated {len(db_cams)} database camera record(s) with injected intrinsics: {calibration.params}")
 
-        db.close()
+            db.close()
         profiles.append(
             SfmStageProfile(
                 stage_name="camera_injection",
@@ -182,14 +190,15 @@ class SfmRunner:
         if self.config.ignore_watermarks:
             tvg_opts.detect_watermark = False
 
-        try:
-            pycolmap.match_sequential(
-                str(database_path),
-                matching_options=seq_opts,
-                verification_options=tvg_opts,
-            )
-        except Exception as exc:
-            raise Uav3dError(f"Sequential feature matching failed: {exc}") from exc
+        with NativeStderrCapture(native_log_path):
+            try:
+                pycolmap.match_sequential(
+                    str(database_path),
+                    matching_options=seq_opts,
+                    verification_options=tvg_opts,
+                )
+            except Exception as exc:
+                raise Uav3dError(f"Sequential feature matching failed: {exc}") from exc
 
         profiles.append(
             SfmStageProfile(
@@ -223,15 +232,27 @@ class SfmRunner:
         pipeline_opts.min_model_size = self.config.min_model_size
         pipeline_opts.ignore_watermarks = self.config.ignore_watermarks
 
-        try:
-            reconstructions = pycolmap.incremental_mapping(
-                database_path=str(database_path),
-                image_path=str(img_path),
-                output_path=str(sparse_dir),
-                options=pipeline_opts,
-            )
-        except Exception as exc:
-            raise Uav3dError(f"Incremental mapping failed with exception: {exc}") from exc
+        # Single-model mode by default: stop after the main reconstruction instead of
+        # burning time (and log spam) trying to grow secondary models from leftover
+        # unregistered frames. This is the fix for the repeated
+        # 'Discarding reconstruction due to insufficient size' tail on long runs.
+        pipeline_opts.multiple_models = self.config.multiple_models
+        pipeline_opts.init_num_trials = self.config.init_num_trials
+        logger.info(
+            f"Multi-model attempts: {'enabled' if self.config.multiple_models else 'disabled (single-model mode)'}; "
+            f"init_num_trials={self.config.init_num_trials}; min_model_size={self.config.min_model_size}"
+        )
+
+        with NativeStderrCapture(native_log_path):
+            try:
+                reconstructions = pycolmap.incremental_mapping(
+                    database_path=str(database_path),
+                    image_path=str(img_path),
+                    output_path=str(sparse_dir),
+                    options=pipeline_opts,
+                )
+            except Exception as exc:
+                raise Uav3dError(f"Incremental mapping failed with exception: {exc}") from exc
 
         profiles.append(
             SfmStageProfile(
@@ -260,6 +281,15 @@ class SfmRunner:
         if num_reg == 0:
             raise Uav3dError("Selected reconstruction contains 0 registered images.")
 
+        if num_reg < total_images and not self.config.multiple_models:
+            logger.info(
+                f"{total_images - num_reg} image(s) not registered in the main model. "
+                "Single-model mode is active: COLMAP will NOT attempt secondary reconstructions "
+                "from these frames (this is intentional and avoids the multi-hour tail of "
+                "'Discarding reconstruction due to insufficient size' attempts). "
+                "Set sfm.multiple_models=true to allow secondary model attempts."
+            )
+
         reg_rate = float(num_reg / max(1, total_images))
         mean_reproj = (
             float(selected_rec.compute_mean_reprojection_error())
@@ -277,8 +307,7 @@ class SfmRunner:
                 f"(expected: {expected_params.tolist()})"
             )
 
-            if not self.config.refine_intrinsics:
-                if not np.allclose(actual_params, expected_params, atol=1e-3):
+            if not self.config.refine_intrinsics and not np.allclose(actual_params, expected_params, atol=1e-3):
                     raise Uav3dError(
                         f"Camera intrinsics were modified during bundle adjustment despite refine_intrinsics=False! "
                         f"Expected: {expected_params.tolist()}, Got: {actual_params.tolist()}"

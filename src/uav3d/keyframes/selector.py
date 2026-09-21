@@ -100,6 +100,7 @@ class KeyframeSelector:
         source: ImageSource,
         output_dir: str | Path,
         dataset_label: str = "replayed public dataset",
+        frame_budget: int | None = None,
     ) -> SelectionSummary:
         """Execute deterministic keyframe selection and write outputs.
 
@@ -107,6 +108,10 @@ class KeyframeSelector:
             source: Ingestion source yielding FrameRecords.
             output_dir: Run output directory (e.g. data/outputs/run_<timestamp>).
             dataset_label: Provenance label for keyframes.json.
+            frame_budget: Optional hard cap on how many source frames get quality
+                evaluation. Long videos (thousands of frames) are pre-strided so
+                that at most ~frame_budget frames are decoded and scored. The
+                selection cap (max_frames) is still applied afterwards.
         """
         run_dir = Path(output_dir).resolve()
         sfm_images_dir = run_dir / "sfm" / "images"
@@ -115,12 +120,24 @@ class KeyframeSelector:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Collect all frames sequentially
-        frames: list[FrameRecord] = list(source.iter_frames())
-        total_frames = len(frames)
-        if total_frames == 0:
+        all_frames: list[FrameRecord] = list(source.iter_frames())
+        total_source_frames = len(all_frames)
+        if total_source_frames == 0:
             raise Uav3dError("Source yielded 0 frames; cannot extract keyframes.")
 
-        logger.info(f"Keyframe selection: evaluating {total_frames} frames from source")
+        # 1b. Pre-stride long sources to honor the frame budget (deterministic)
+        frames = all_frames
+        pre_stride = 1
+        if frame_budget is not None and len(all_frames) > frame_budget:
+            pre_stride = -(-len(all_frames) // frame_budget)  # ceil division
+            frames = all_frames[::pre_stride]
+            logger.info(
+                f"Source has {len(all_frames)} frames > budget {frame_budget}: "
+                f"pre-striding with stride={pre_stride} -> {len(frames)} candidate frames"
+            )
+
+        total_frames = len(frames)
+        logger.info(f"Keyframe selection: evaluating {total_frames} frames from source (pre_stride={pre_stride})")
 
         # 2. Pre-evaluate frame metrics cache
         metrics_cache: dict[str, FrameQualityMetrics | None] = {}
@@ -142,16 +159,21 @@ class KeyframeSelector:
             video_file = str(getattr(source, "video_path", first_frame_path))
             cap = cv2.VideoCapture(video_file)
             try:
-                frame_idx = 0
-                while cap.isOpened() and frame_idx < total_frames:
+                for frame in frames:
+                    # Seek to the frame's global index (frames may be pre-strided,
+                    # so a plain sequential read would misalign metrics to frames).
+                    match = re.search(r"(\d+)$", frame.frame_id)
+                    if not match:
+                        decode_failed_count += 1
+                        continue
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(match.group(1)))
                     ret, bgr = cap.read()
                     if not ret or bgr is None:
                         decode_failed_count += 1
-                        frame_idx += 1
+                        metrics_cache[frame.frame_id] = None
                         continue
                     metrics = compute_frame_quality(bgr, orb_features=self.orb_features)
-                    fid = frames[frame_idx].frame_id
-                    metrics_cache[fid] = metrics
+                    metrics_cache[frame.frame_id] = metrics
                     if metrics is None:
                         decode_failed_count += 1
                     else:
@@ -159,7 +181,6 @@ class KeyframeSelector:
                         all_brightness.append(metrics.brightness_mean)
                         all_clipping.append(metrics.clipping_ratio)
                         all_features.append(float(metrics.feature_count))
-                    frame_idx += 1
             finally:
                 cap.release()
         else:

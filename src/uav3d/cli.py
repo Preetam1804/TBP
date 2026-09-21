@@ -1,6 +1,7 @@
 """Command-line interface for the uav3d pipeline."""
 
 import argparse
+import logging
 import os
 import sys
 from collections.abc import Sequence
@@ -16,6 +17,7 @@ from uav3d.config import PipelineConfig, load_config
 from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
+from uav3d.modeling import export_model, update_summary
 from uav3d.models.frames import CameraCalibration
 from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
@@ -32,8 +34,12 @@ from uav3d.validation import (
 
 console = Console()
 err_console = Console(stderr=True)
+logger = logging.getLogger("uav3d.cli")
 
-SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate")
+SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate", "reconstruct")
+
+VIDEO_FIELD_LABEL = "user-provided video (field capture)"
+DEFAULT_LABEL = "replayed public dataset"
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -165,8 +171,17 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
 
+        budget = getattr(args, "max_frames", None)
+        if budget is not None:
+            cfg.keyframes.max_frames = min(cfg.keyframes.max_frames, budget)
+            cfg.ingest.max_frames = budget
         selector = KeyframeSelector(config=cfg.keyframes)
-        summary = selector.select(source=source, output_dir=run_dir, dataset_label=cfg.dataset_label)
+        summary = selector.select(
+            source=source,
+            output_dir=run_dir,
+            dataset_label=cfg.dataset_label,
+            frame_budget=cfg.ingest.max_frames,
+        )
 
         table = Table(title=f"Keyframe Extraction Summary: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
         table.add_column("Metric / Property", style="bold white", width=28)
@@ -195,6 +210,79 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
 
         console.print(table)
     return 0
+
+
+def _resolve_calibration(
+    images_dir: Path,
+    all_image_names: list[str],
+    cfg: PipelineConfig,
+    data_dir: str,
+    args: argparse.Namespace,
+) -> CameraCalibration:
+    """Resolve camera calibration for an SfM run.
+
+    Video runs (or any run whose image resolution differs from the Zurich
+    reference 1920x1080) get an auto-configured PINHOLE model with a generic
+    focal-length prior and refine_intrinsics=True, because video capture has no
+    known intrinsics to lock. Zurich runs use the dataset's OPENCV calibration.
+    """
+    actual_width, actual_height = None, None
+    if all_image_names:
+        first_img_path = images_dir / all_image_names[0]
+        if first_img_path.exists():
+            import cv2
+
+            sample_mat = cv2.imread(str(first_img_path))
+            if sample_mat is not None:
+                actual_height, actual_width = sample_mat.shape[:2]
+
+    is_video_run = (
+        any(name.startswith("video_") for name in all_image_names)
+        or getattr(args, "video", None) is not None
+        or cfg.source.type.lower() == "video"
+    )
+
+    if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
+        w = actual_width or 1920
+        h = actual_height or 1080
+        fx = fy = float(w) * 0.9
+        cx = float(w) / 2.0
+        cy = float(h) / 2.0
+        calibration = CameraCalibration(
+            model="PINHOLE",
+            width=w,
+            height=h,
+            params=[fx, fy, cx, cy],
+            source=f"auto_video_{w}x{h}",
+        )
+        cfg.sfm.camera_model = "PINHOLE"
+        cfg.sfm.refine_intrinsics = True
+        logger.info(
+            f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
+            f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
+        )
+    else:
+        source = _build_source(cfg, data_dir, args)
+        calibration = source.calibration()
+        logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+
+    return calibration
+
+
+def _find_ground_truth(data_dir: str, args: argparse.Namespace) -> Path | None:
+    """Locate GroundTruthAGL.csv (explicit --gt-file first, then standard dataset paths)."""
+    if getattr(args, "gt_file", None):
+        gt = Path(args.gt_file).resolve()
+        return gt if gt.exists() else None
+    candidates = [
+        Path(data_dir) / "raw" / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
+        Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
+        Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _handle_sfm_command(args: argparse.Namespace) -> int:
@@ -233,47 +321,8 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         all_image_names = [f"{kf.frame_id}.jpg" for kf in kf_file.keyframes]
         timestamps_map = {kf.frame_id: kf.timestamp_us for kf in kf_file.keyframes}
 
-        # 3. Obtain camera calibration
-        # Check actual image dimensions in images_dir to avoid Zurich calibration mismatch
-        actual_width, actual_height = None, None
-        if all_image_names:
-            first_img_path = images_dir / all_image_names[0]
-            if first_img_path.exists():
-                import cv2
-
-                sample_mat = cv2.imread(str(first_img_path))
-                if sample_mat is not None:
-                    actual_height, actual_width = sample_mat.shape[:2]
-
-        is_video_run = (
-            any(name.startswith("video_") for name in all_image_names)
-            or getattr(args, "video", None) is not None
-            or cfg.source.type.lower() == "video"
-        )
-
-        if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
-            w = actual_width or 1920
-            h = actual_height or 1080
-            fx = fy = float(w) * 0.9
-            cx = float(w) / 2.0
-            cy = float(h) / 2.0
-            calibration = CameraCalibration(
-                model="PINHOLE",
-                width=w,
-                height=h,
-                params=[fx, fy, cx, cy],
-                source=f"auto_video_{w}x{h}",
-            )
-            cfg.sfm.camera_model = "PINHOLE"
-            cfg.sfm.refine_intrinsics = True
-            logger.info(
-                f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
-                f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
-            )
-        else:
-            source = _build_source(cfg, data_dir, args)
-            calibration = source.calibration()
-            logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+        # 3. Obtain camera calibration (auto PINHOLE for video runs)
+        calibration = _resolve_calibration(images_dir, all_image_names, cfg, data_dir, args)
 
         # 4. Optional CLI overrides
         if getattr(args, "overlap", None) is not None:
@@ -342,6 +391,217 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
                 f"[bold green]SfM Quality Gate Passed:[/bold green] Registration {result.registration_rate*100:.1f}% >= 85%, "
                 f"Reprojection Error {result.mean_reprojection_error_px:.3f} px <= 1.5 px."
             )
+
+    return 0
+
+
+def _handle_reconstruct_command(args: argparse.Namespace) -> int:
+    """Execute the full single-pass pipeline: video -> keyframes -> SfM -> 3D model.
+
+    One command, end to end:
+      1. Ingest the video (or configured source)
+      2. Keyframe selection with a hard frame budget (--max-frames)
+      3. pycolmap incremental SfM (single-model mode by default: no multi-hour
+         'Discarding reconstruction due to insufficient size' tail)
+      4. Pose export (poses.json)
+      5. 3D model export (model.ply, model/, trajectory.ply, summary JSON)
+      6. Telemetry sync (Zurich sources only; skipped for video-only runs)
+      7. ATE validation (only when ground truth is available)
+    """
+    logger = setup_logging()
+    cfg = load_config(args.config if os.path.exists(args.config) else None)
+    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+
+    with timed_stage("reconstruct", logger=logger):
+        # 0. Source + provenance label
+        source = _build_source(cfg, data_dir, args)
+        is_video = isinstance(source, VideoFileSource)
+        dataset_label = getattr(args, "label", None)
+        if dataset_label is None:
+            dataset_label = VIDEO_FIELD_LABEL if is_video else cfg.dataset_label
+
+        timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Reconstruct run directory: {run_dir}")
+
+        source_meta = source.metadata()
+        logger.info(
+            f"Source: {source_meta.name} | frames={source_meta.frame_count:,} "
+            f"fps={source_meta.fps} res={source_meta.width}x{source_meta.height}"
+        )
+
+        # 1. Keyframe selection with frame budget (long videos are pre-strided)
+        budget = getattr(args, "max_frames", None) or cfg.ingest.max_frames
+        kf_cfg = cfg.keyframes
+        if getattr(args, "stride", None) is not None:
+            kf_cfg.stride = args.stride
+        kf_cfg.max_frames = min(kf_cfg.max_frames, budget)
+
+        selector = KeyframeSelector(config=kf_cfg)
+        kf_summary = selector.select(
+            source=source,
+            output_dir=run_dir,
+            dataset_label=dataset_label,
+            frame_budget=budget,
+        )
+        if kf_summary.selected_count == 0:
+            raise Uav3dError(
+                "Keyframe selection produced 0 frames. The video may be too short, "
+                "too blurry, or entirely clipped. Check debug/contact_sheet.jpg and "
+                "try a lower --max-frames or a different clip of the video."
+            )
+        logger.info(
+            f"Keyframes: {kf_summary.selected_count}/{source_meta.frame_count:,} source frames "
+            f"(evaluated={kf_summary.considered_count}, budget={budget})"
+        )
+
+        # 2. SfM (single-model mode by default)
+        kf_file = KeyframesFile.model_validate_json((run_dir / "keyframes.json").read_text(encoding="utf-8"))
+        all_image_names = [f"{kf.frame_id}.jpg" for kf in kf_file.keyframes]
+        timestamps_map = {kf.frame_id: kf.timestamp_us for kf in kf_file.keyframes}
+
+        calibration = _resolve_calibration(run_dir / "sfm" / "images", all_image_names, cfg, data_dir, args)
+
+        sfm_cfg = cfg.sfm
+        if getattr(args, "overlap", None) is not None:
+            sfm_cfg.seq_overlap = args.overlap
+        if getattr(args, "init_trials", None) is not None:
+            sfm_cfg.init_num_trials = args.init_trials
+        sfm_cfg.multiple_models = (getattr(args, "models", "single") == "multi")
+
+        runner = SfmRunner(config=sfm_cfg)
+        result = runner.run(
+            images_dir=run_dir / "sfm" / "images",
+            output_dir=run_dir,
+            calibration=calibration,
+            native_log_path=run_dir / "colmap_native.log",
+        )
+        if result.num_reg_images < 2:
+            raise Uav3dError(
+                f"SfM registered only {result.num_reg_images} frame(s); a 3D model needs at least 2. "
+                "This usually means the video is a near-static shot, has heavy motion blur, or the "
+                "scene lacks texture. Try a longer clip with clear camera motion, or lower --max-frames."
+            )
+
+        # 3. Pose export
+        poses_path = run_dir / "poses.json"
+        poses_file = export_poses(
+            reconstruction=result.reconstruction,
+            all_image_names=all_image_names,
+            camera_calibration=calibration,
+            output_path=poses_path,
+            dataset_label=dataset_label,
+            scale_factor=1.0,
+            timestamps_map=timestamps_map,
+        )
+        logger.info(f"Wrote poses to {poses_path}")
+
+        # 4. 3D model export
+        model_result = export_model(
+            reconstruction=result.reconstruction,
+            run_dir=run_dir,
+            dataset_label=dataset_label,
+            num_source_frames=source_meta.frame_count,
+            num_keyframes=kf_summary.selected_count,
+            num_models=result.num_models,
+            mean_reprojection_error_px=result.mean_reprojection_error_px,
+        )
+
+        # 5. Telemetry sync (only when the source carries telemetry records)
+        telemetry_wrote = False
+        if hasattr(source, "_gps_records"):
+            synchronizer = TelemetrySynchronizer(config=cfg.sync)
+            tel_file, poses_enriched = synchronizer.sync(
+                poses=poses_file,
+                keyframes=kf_file,
+                raw_telemetry=source._gps_records,
+                dataset_label=dataset_label,
+                mode="zurich",
+            )
+            telemetry_path = run_dir / "telemetry.json"
+            telemetry_path.write_text(tel_file.model_dump_json(indent=2), encoding="utf-8")
+            (run_dir / "poses_enriched.json").write_text(poses_enriched.model_dump_json(indent=2), encoding="utf-8")
+            telemetry_wrote = True
+            logger.info(f"Wrote synchronized telemetry to {telemetry_path}")
+        else:
+            logger.info(
+                "Telemetry sync skipped: no telemetry records for this source "
+                "(video-only runs have no GPS logs). Metric scale remains unknown; "
+                "run 'uav3d sync' later if telemetry becomes available."
+            )
+
+        # 6. ATE validation (only when ground truth exists)
+        ate_wrote = False
+        gt_file = _find_ground_truth(data_dir, args)
+        if gt_file is not None:
+            try:
+                ate_report = compute_ate(
+                    poses_file=poses_file,
+                    gt_records=gt_file,
+                    ate_threshold_m=cfg.validation.ate_threshold_meters,
+                    dataset_label=dataset_label,
+                )
+                ate_path = run_dir / "ate_report.json"
+                ate_path.write_text(ate_report.model_dump_json(indent=2), encoding="utf-8")
+                ate_wrote = True
+                logger.info(f"Wrote ATE report to {ate_path} (RMSE={ate_report.metrics.rmse_m:.4f} m)")
+            except Uav3dError as exc:
+                logger.warning(f"ATE validation skipped: {exc}")
+        else:
+            logger.info("ATE validation skipped: no ground truth file found (expected for video-only runs).")
+
+        # 7. Patch the summary manifest with stage-5/6 artifacts
+        update_summary(
+            model_result.summary_path,
+            telemetry_json="telemetry.json" if telemetry_wrote else None,
+            ate_report_json="ate_report.json" if ate_wrote else None,
+        )
+
+        # 8. Final summary table
+        table = Table(
+            title=f"Reconstruction Complete: [bold cyan]{run_dir.name}[/bold cyan]",
+            show_header=True,
+        )
+        table.add_column("Stage / Artifact", style="bold white", width=32)
+        table.add_column("Value", style="green")
+
+        reg_style = "bold green" if result.registration_rate >= 0.85 else "bold yellow"
+        reproj_style = "bold green" if result.mean_reprojection_error_px <= 1.5 else "bold yellow"
+
+        table.add_row("Source", f"{source_meta.name} ({source_meta.frame_count:,} frames, {source_meta.width}x{source_meta.height})")
+        table.add_row("Keyframes Selected", f"{kf_summary.selected_count} (budget {budget}, evaluated {kf_summary.considered_count})")
+        table.add_row("Frames Registered", f"[{reg_style}]{result.num_reg_images}/{kf_summary.selected_count}[/] ({result.registration_rate*100:.1f}%)")
+        table.add_row("Mean Reprojection Error", f"[{reproj_style}]{result.mean_reprojection_error_px:.3f} px[/]")
+        table.add_row("3D Points", f"{model_result.num_points:,}")
+        table.add_row("SfM Wall Time", f"{result.total_wall_time_s:.1f} s (peak {result.peak_rss_mb:.0f} MB)")
+        table.add_row("Telemetry Sync", "done (telemetry.json)" if telemetry_wrote else "skipped (no telemetry for video-only run)")
+        table.add_row("ATE Validation", "done (ate_report.json)" if ate_wrote else "skipped (no ground truth)")
+        table.add_row("Dataset Label", dataset_label)
+        table.add_row("3D Model (point cloud)", str(model_result.model_ply))
+        table.add_row("COLMAP Sparse Model", str(model_result.model_dir))
+        table.add_row("Camera Trajectory", str(model_result.trajectory_ply))
+        table.add_row("Poses JSON", str(poses_path))
+        table.add_row("Run Summary", str(model_result.summary_path))
+        table.add_row("Raw COLMAP Log", str(run_dir / "colmap_native.log"))
+
+        console.print(table)
+        console.print(
+            Panel.fit(
+                "[bold]Open the 3D model:[/bold] model.ply (colored point cloud) and model/ (cameras + poses)\n"
+                "in CloudCompare, MeshLab, or Blender. trajectory.ply shows the camera flight path.\n"
+                f"[dim]Scale note: {model_result.summary_path.name} records the monocular scale caveat.[/dim]",
+                border_style="blue",
+            )
+        )
+
+        if result.registration_rate < 0.85:
+            console.print(
+                "[yellow]Warning: registration rate below 85%. Try a clip with more camera motion, "
+                "more overlap (--overlap 20), or a larger --max-frames.[/yellow]"
+            )
+        if kf_summary.decode_failed_count > 0:
+            console.print(f"[yellow]Warning: {kf_summary.decode_failed_count} frame(s) failed to decode.[/yellow]")
 
     return 0
 
@@ -592,6 +852,12 @@ def create_parser() -> argparse.ArgumentParser:
         help="Extract and select sharp keyframes from ingested video/images",
     )
     _add_common_arguments(keyframes_parser)
+    keyframes_parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Hard frame budget: at most this many source frames are evaluated (long videos are pre-strided)",
+    )
 
     # 3. sfm
     sfm_parser = subparsers.add_parser(
@@ -651,6 +917,59 @@ def create_parser() -> argparse.ArgumentParser:
         help="Path to GroundTruthAGL.csv (defaults to dataset location)",
     )
 
+    # 6. reconstruct (single-pass end-to-end)
+    reconstruct_parser = subparsers.add_parser(
+        "reconstruct",
+        help="Single-pass end-to-end: video -> keyframes -> SfM -> 3D model (point cloud + trajectory)",
+    )
+    _add_common_arguments(reconstruct_parser)
+    reconstruct_parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Hard frame budget: at most this many source frames are evaluated, and at most this many keyframes reach SfM (default from config)",
+    )
+    reconstruct_parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Override keyframe subsampling stride",
+    )
+    reconstruct_parser.add_argument(
+        "--overlap",
+        type=int,
+        default=None,
+        help="Override sequential matching overlap window",
+    )
+    reconstruct_parser.add_argument(
+        "--models",
+        type=str,
+        choices=["single", "multi"],
+        default="single",
+        help=(
+            "single (default): stop after the main reconstruction - no 'Discarding reconstruction "
+            "due to insufficient size' tail. multi: allow COLMAP to try secondary models from leftover frames"
+        ),
+    )
+    reconstruct_parser.add_argument(
+        "--init-trials",
+        type=int,
+        default=None,
+        help="Maximum COLMAP initialization trials per model attempt (default 200)",
+    )
+    reconstruct_parser.add_argument(
+        "--gt-file",
+        type=str,
+        default=None,
+        help="Optional ground truth CSV; enables ATE validation (otherwise skipped)",
+    )
+    reconstruct_parser.add_argument(
+        "--label",
+        type=str,
+        default=None,
+        help="Dataset provenance label recorded in all outputs",
+    )
+
     return parser
 
 
@@ -673,6 +992,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_sync_command(args)
         if args.command == "validate":
             return _handle_validate_command(args)
+        if args.command == "reconstruct":
+            return _handle_reconstruct_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()
