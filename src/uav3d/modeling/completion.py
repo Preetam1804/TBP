@@ -413,6 +413,7 @@ def build_full_3d_map(
     """
     map_3d_ply = run_dir / "map_3d.ply"
     map_3d_glb = run_dir / "map_3d.glb"
+    map_3d_obj = run_dir / "map_3d.obj"
     ortho_png = run_dir / "orthomosaic.png"
     dsm_png = run_dir / "dsm_elevation.png"
 
@@ -420,49 +421,80 @@ def build_full_3d_map(
     if len(pcd.points) < 50:
         return map_3d_ply, map_3d_glb, ortho_png, dsm_png
 
-    logger.info("Executing LoD-2 Planar Reconstruction & Projective UV Texturing...")
+    logger.info("Executing Authentic Photogrammetric 3D Reconstruction...")
 
-    # 1. Ground & Structure Decomposition with Upright Normalization
-    from uav3d.modeling.lod2 import build_clipped_terrain_mesh, decompose_and_align_scene, reconstruct_lod2_structures
-    from uav3d.modeling.texturing import bake_lod2_textured_model
+    # 1. Statistical Outlier Removal & Voxel Downsampling
+    pcd_sub = pcd.voxel_down_sample(0.20)
+    pcd_clean, _ = pcd_sub.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
-    R_up, d_offset, terrain_pts, struct_pts, terrain_cols, struct_cols = decompose_and_align_scene(pcd)
+    # 2. Ground Plane Alignment (Upright normal [0, 0, 1])
+    from scipy.spatial import Delaunay
+    import trimesh
 
-    # 2. Clipped Terrain (strictly bounded to survey convex hull, zero stretched boundary artifacts)
-    terrain_mesh, terrain_bounds = build_clipped_terrain_mesh(terrain_pts, terrain_cols, grid_res_m=0.25)
+    plane, _ = pcd_clean.segment_plane(0.25, 3, 500)
+    a, b, c, d = plane
+    norm = np.linalg.norm([a, b, c]) + 1e-8
+    a, b, c, d = a / norm, b / norm, c / norm, d / norm
+    normal = np.array([a, b, c])
 
-    # 3. LoD-2 Planar Structure Reconstruction (multi-tier setbacks + 90° planar walls)
-    lod2_mesh = reconstruct_lod2_structures(struct_pts, struct_cols, ground_z=0.0)
+    pts = np.asarray(pcd_clean.points)
+    cols = np.asarray(pcd_clean.colors)
 
-    # Combined upright geometry for 2D GIS elevation rasterization
-    if len(lod2_mesh.triangles) > 0 and len(terrain_mesh.triangles) > 0:
-        full_upright = terrain_mesh + lod2_mesh
-    elif len(terrain_mesh.triangles) > 0:
-        full_upright = terrain_mesh
+    h = pts @ normal + d
+    if np.percentile(h, 95) - np.median(h) < np.median(h) - np.percentile(h, 5):
+        normal, d = -normal, -d
+
+    target = np.array([0.0, 0.0, 1.0])
+    v_axis = np.cross(normal, target)
+    s = np.linalg.norm(v_axis)
+    dot_val = float(np.dot(normal, target))
+    if s > 1e-6:
+        vx = np.array([[0, -v_axis[2], v_axis[1]], [v_axis[2], 0, -v_axis[0]], [-v_axis[1], v_axis[0], 0]])
+        R_up = np.eye(3) + vx + (vx @ vx) * ((1.0 - dot_val) / (s * s + 1e-8))
     else:
-        full_upright = lod2_mesh
+        R_up = np.eye(3) if dot_val > 0 else -np.eye(3)
 
-    # 4. Generate 2D Orthomosaic and DSM (directly upright on ground)
-    generate_2d_orthomosaic_and_dsm(full_upright, np.array([0.0, 0.0, 1.0, 0.0]), ortho_png, dsm_png)
+    pts_up = pts @ R_up.T
+    pts_up[:, 2] += d
 
-    # 5. Projective Camera UV Texture Baking
-    # Exports map_3d.obj + map_3d.mtl + texture_atlas.png + map_3d.glb + map_3d.ply
-    v_terr = np.asarray(terrain_mesh.vertices)
-    t_terr = np.asarray(terrain_mesh.triangles)
-    v_bldg = np.asarray(lod2_mesh.vertices)
-    t_bldg = np.asarray(lod2_mesh.triangles)
+    # 3. 2.5D Photogrammetric Surface Meshing with Boundary Ray Pruning
+    tri = Delaunay(pts_up[:, :2])
+    v0 = pts_up[tri.simplices[:, 0], :2]
+    v1 = pts_up[tri.simplices[:, 1], :2]
+    v2 = pts_up[tri.simplices[:, 2], :2]
 
-    try:
-        bake_lod2_textured_model(v_terr, t_terr, terrain_bounds, v_bldg, t_bldg, run_dir, R_up, d_offset)
-    except Exception as exc:
-        logger.warning(f"UV texture baking fallback: {exc}")
-        if len(full_upright.triangles) > 0:
-            o3d.io.write_triangle_mesh(str(map_3d_ply), full_upright)
+    l0 = np.linalg.norm(v1 - v0, axis=1)
+    l1 = np.linalg.norm(v2 - v1, axis=1)
+    l2 = np.linalg.norm(v0 - v2, axis=1)
+    max_edge = np.maximum(l0, np.maximum(l1, l2))
 
-    # 6. Generate interactive 3D WebGL and 2D GIS Dashboard
+    valid_mask = max_edge < 1.0
+    clean_tris = tri.simplices[valid_mask]
+
+    # Create solid Trimesh model with authentic per-vertex colors
+    mesh_tri = trimesh.Trimesh(vertices=pts_up, faces=clean_tris, vertex_colors=cols, process=False)
+    mesh_tri.fix_normals()
+
+    # Export universal formats
+    mesh_tri.export(str(map_3d_glb))
+    mesh_tri.export(str(map_3d_ply))
+    mesh_tri.export(str(map_3d_obj))
+
+    logger.info(
+        f"Exported clean photogrammetric 3D digital twin: "
+        f"{len(mesh_tri.vertices):,} vertices, {len(mesh_tri.faces):,} faces (zero boundary stretching)"
+    )
+
+    # 4. Generate 2D Orthomosaic and DSM deliverables
+    full_o3d = o3d.geometry.TriangleMesh()
+    full_o3d.vertices = o3d.utility.Vector3dVector(pts_up)
+    full_o3d.vertex_colors = o3d.utility.Vector3dVector(cols)
+    full_o3d.triangles = o3d.utility.Vector3iVector(clean_tris.astype(np.int32))
+    generate_2d_orthomosaic_and_dsm(full_o3d, np.array([0.0, 0.0, 1.0, 0.0]), ortho_png, dsm_png)
+
+    # 5. Generate interactive viewer.html
     try:
         from uav3d.modeling.dashboard import generate_viewer_html
-
         generate_viewer_html(run_dir)
     except Exception as exc:
         logger.debug(f"Viewer generation skipped: {exc}")
