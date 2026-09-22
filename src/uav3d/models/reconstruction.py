@@ -11,7 +11,7 @@ class ReconstructionSummary(BaseModel):
     sparse model directory, the camera trajectory, and the pose file.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     schema_version: str = Field(default="1.0.0", description="Schema specification version")
     dataset_label: str = Field(default="replayed public dataset", description="Dataset provenance label")
@@ -29,6 +29,13 @@ class ReconstructionSummary(BaseModel):
         description="Scale interpretation of the exported model",
     )
     model_ply: str = Field(default="model.ply", description="Path (relative to run dir) of the colored point cloud")
+    cloud_dense_ply: str | None = Field(default=None, description="Path (relative to run dir) of dense point cloud")
+    mesh_ply: str | None = Field(default=None, description="Path (relative to run dir) of surface triangle mesh")
+    mesh_decimated_ply: str | None = Field(default=None, description="Path (relative to run dir) of decimated mesh")
+    map_3d_ply: str | None = Field(default=None, description="Path (relative to run dir) of completed 3D map mesh")
+    map_3d_glb: str | None = Field(default=None, description="Path (relative to run dir) of WebGL 3D map asset")
+    orthomosaic_png: str | None = Field(default=None, description="Path (relative to run dir) of 2D top-down orthomosaic")
+    dsm_png: str | None = Field(default=None, description="Path (relative to run dir) of Digital Surface Model heatmap")
     model_dir: str = Field(default="model", description="Path (relative to run dir) of the COLMAP sparse model directory")
     trajectory_ply: str = Field(default="trajectory.ply", description="Path (relative to run dir) of the camera path")
     poses_json: str = Field(default="poses.json", description="Path (relative to run dir) of the pose file")

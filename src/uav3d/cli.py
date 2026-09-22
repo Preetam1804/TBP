@@ -36,7 +36,7 @@ console = Console()
 err_console = Console(stderr=True)
 logger = logging.getLogger("uav3d.cli")
 
-SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate", "reconstruct")
+SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate", "reconstruct", "view")
 
 VIDEO_FIELD_LABEL = "user-provided video (field capture)"
 DEFAULT_LABEL = "replayed public dataset"
@@ -579,6 +579,18 @@ def _handle_reconstruct_command(args: argparse.Namespace) -> int:
         table.add_row("ATE Validation", "done (ate_report.json)" if ate_wrote else "skipped (no ground truth)")
         table.add_row("Dataset Label", dataset_label)
         table.add_row("3D Model (point cloud)", str(model_result.model_ply))
+        if model_result.map_3d_ply and model_result.map_3d_ply.exists():
+            table.add_row("Full 3D Map (Completed)", str(model_result.map_3d_ply))
+        if model_result.map_3d_glb and model_result.map_3d_glb.exists():
+            table.add_row("3D Map Asset (WebGL/GLB)", str(model_result.map_3d_glb))
+        if model_result.mesh_decimated_ply and model_result.mesh_decimated_ply.exists():
+            table.add_row("3D Surface Mesh", str(model_result.mesh_decimated_ply))
+        if model_result.cloud_dense_ply and model_result.cloud_dense_ply.exists():
+            table.add_row("Dense Point Cloud", str(model_result.cloud_dense_ply))
+        if model_result.orthomosaic_png and model_result.orthomosaic_png.exists():
+            table.add_row("2D Orthomosaic Aerial Map", str(model_result.orthomosaic_png))
+        if model_result.dsm_png and model_result.dsm_png.exists():
+            table.add_row("Digital Surface Model (DSM)", str(model_result.dsm_png))
         table.add_row("COLMAP Sparse Model", str(model_result.model_dir))
         table.add_row("Camera Trajectory", str(model_result.trajectory_ply))
         table.add_row("Poses JSON", str(poses_path))
@@ -588,8 +600,10 @@ def _handle_reconstruct_command(args: argparse.Namespace) -> int:
         console.print(table)
         console.print(
             Panel.fit(
-                "[bold]Open the 3D model:[/bold] model.ply (colored point cloud) and model/ (cameras + poses)\n"
-                "in CloudCompare, MeshLab, or Blender. trajectory.ply shows the camera flight path.\n"
+                "[bold]Open the 3D Map & GIS Deliverables:[/bold]\n"
+                "• [bold green]map_3d.ply[/bold green] / [bold green]map_3d.glb[/bold green]: Full completed 3D map with closed volumetric structures & continuous terrain\n"
+                "• [bold cyan]orthomosaic.png[/bold cyan] & [bold cyan]dsm_elevation.png[/bold cyan]: Top-down 2D aerial map and elevation heatmap\n"
+                "• [bold]mesh_decimated.ply[/bold] & [bold]cloud_dense.ply[/bold]: Photogrammetric surface and dense point cloud\n"
                 f"[dim]Scale note: {model_result.summary_path.name} records the monocular scale caveat.[/dim]",
                 border_style="blue",
             )
@@ -805,6 +819,70 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_view_command(args: argparse.Namespace) -> int:
+    """Launch local web server and open interactive 3D WebGL / GIS Dashboard."""
+    import http.server
+    import socketserver
+    import threading
+    import webbrowser
+    from uav3d.modeling.dashboard import generate_viewer_html
+
+    run_dir = Path(args.run_dir).resolve() if getattr(args, "run_dir", None) else None
+    if not run_dir:
+        outputs_dir = Path("data/outputs").resolve()
+        runs = sorted(outputs_dir.glob("run_*"))
+        if not runs:
+            err_console.print("[bold red]No reconstruction runs found in data/outputs/[/bold red]")
+            return 1
+        run_dir = runs[-1]
+
+    viewer_html = run_dir / "viewer.html"
+    if not viewer_html.exists() or getattr(args, "refresh", False):
+        generate_viewer_html(run_dir)
+
+    port = getattr(args, "port", None) or 8080
+    url = f"http://localhost:{port}/viewer.html"
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]UAV-3D Interactive Digital Twin Dashboard[/bold cyan]\n\n"
+            f"Run Directory: [green]{run_dir}[/green]\n"
+            f"Server URL:    [bold yellow]{url}[/bold yellow]\n\n"
+            f"[dim]Serving WebGL 3D model, 2D Orthomosaic, and DSM heatmap.[/dim]\n"
+            f"[dim]Press Ctrl+C to stop the viewer server.[/dim]",
+            border_style="cyan",
+            title="3D Mission Dashboard",
+        )
+    )
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(run_dir), **kw)
+
+        def log_message(self, format, *a):
+            pass
+
+    try:
+        httpd = socketserver.TCPServer(("", port), QuietHandler)
+    except OSError:
+        port = port + 1
+        url = f"http://localhost:{port}/viewer.html"
+        httpd = socketserver.TCPServer(("", port), QuietHandler)
+
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    webbrowser.open(url)
+
+    try:
+        import time
+
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Dashboard server stopped.[/yellow]")
+        httpd.shutdown()
+        return 0
+
+
 def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
     """Execute stub for unimplemented pipeline stage."""
     logger = setup_logging()
@@ -970,6 +1048,30 @@ def create_parser() -> argparse.ArgumentParser:
         help="Dataset provenance label recorded in all outputs",
     )
 
+    # 7. view (interactive 3D WebGL / GIS Dashboard)
+    view_parser = subparsers.add_parser(
+        "view",
+        help="Open interactive 3D WebGL / 2D GIS Dashboard in your browser",
+    )
+    view_parser.add_argument(
+        "run_dir",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Reconstruction run directory (defaults to latest in data/outputs/)",
+    )
+    view_parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port for local web server (default: 8080)",
+    )
+    view_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force regeneration of viewer.html",
+    )
+
     return parser
 
 
@@ -994,6 +1096,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_validate_command(args)
         if args.command == "reconstruct":
             return _handle_reconstruct_command(args)
+        if args.command == "view":
+            return _handle_view_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()
