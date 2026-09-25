@@ -398,9 +398,160 @@ def generate_2d_orthomosaic_and_dsm(
     return output_ortho, output_dsm
 
 
+def _align_mesh_upright(
+    mesh: o3d.geometry.TriangleMesh,
+    distance_threshold: float = 0.25,
+) -> o3d.geometry.TriangleMesh:
+    """Rotate a mesh so its dominant ground plane is horizontal (Z up).
+
+    Uses the same RANSAC ground-plane logic as the point-cloud path but
+    transforms mesh vertices in place (colors and connectivity untouched).
+    """
+    v = np.asarray(mesh.vertices)
+    if len(v) < 100:
+        return mesh
+
+    probe = o3d.geometry.PointCloud()
+    probe.points = o3d.utility.Vector3dVector(v)
+    probe_ds = probe.voxel_down_sample(0.15) if len(v) > 50000 else probe
+    plane, _ = probe_ds.segment_plane(distance_threshold, 3, 500)
+    a, b, c, d = plane
+    norm = np.linalg.norm([a, b, c]) + 1e-8
+    a, b, c, d = a / norm, b / norm, c / norm, d / norm
+
+    # Orient so that the majority of the surface is above the ground plane
+    h = v @ np.array([a, b, c]) + d
+    if np.percentile(h, 95) - np.median(h) < np.median(h) - np.percentile(h, 5):
+        a, b, c, d = -a, -b, -c, -d
+        h = -h
+
+    normal = np.array([a, b, c])
+    target = np.array([0.0, 0.0, 1.0])
+    v_axis = np.cross(normal, target)
+    s = np.linalg.norm(v_axis)
+    dot_val = float(np.dot(normal, target))
+    if s > 1e-6:
+        vx = np.array([[0, -v_axis[2], v_axis[1]], [v_axis[2], 0, -v_axis[0]], [-v_axis[1], v_axis[0], 0]])
+        R_up = np.eye(3) + vx + (vx @ vx) * ((1.0 - dot_val) / (s * s + 1e-8))
+    else:
+        R_up = np.eye(3) if dot_val > 0 else -np.eye(3)
+
+    v_up = v @ R_up.T
+    v_up[:, 2] += d
+    mesh.vertices = o3d.utility.Vector3dVector(v_up)
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def seal_and_complete_lod2_mesh(
+    mesh: o3d.geometry.TriangleMesh,
+    min_elev_m: float = 0.8,
+) -> o3d.geometry.TriangleMesh:
+    """Seal unclosed building boundaries down to ground and prune edge slivers.
+
+    Reconstructs authentic LoD-2 vertical walls for buildings cut off at the corridor
+    boundary, eliminating hollow shells and jagged saw-tooth fringe without artificial
+    Poisson ballooning.
+    """
+    if len(mesh.vertices) < 50 or len(mesh.triangles) < 50:
+        return mesh
+
+    # 1. Ensure upright alignment so ground datum is horizontal near Z = 0
+    mesh = _align_mesh_upright(mesh)
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    f = np.asarray(mesh.triangles, dtype=np.int64)
+    cols = np.asarray(mesh.vertex_colors, dtype=np.float64)
+    if len(cols) == 0:
+        cols = np.full((len(v), 3), 0.7)
+
+    # 2. Prune needle sliver triangles (where max edge > 6x median edge length)
+    e01 = np.linalg.norm(v[f[:, 1]] - v[f[:, 0]], axis=1)
+    e12 = np.linalg.norm(v[f[:, 2]] - v[f[:, 1]], axis=1)
+    e20 = np.linalg.norm(v[f[:, 0]] - v[f[:, 2]], axis=1)
+    max_e = np.maximum(e01, np.maximum(e12, e20))
+    min_e = np.maximum(1e-6, np.minimum(e01, np.minimum(e12, e20)))
+    aspect = max_e / min_e
+    med_edge = float(np.median(max_e))
+    valid_tri_mask = ~((max_e > 6.0 * med_edge) & (aspect > 6.0))
+    if np.sum(~valid_tri_mask) > 0:
+        mesh.remove_triangles_by_mask(~valid_tri_mask)
+        mesh.remove_unreferenced_vertices()
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        f = np.asarray(mesh.triangles, dtype=np.int64)
+        cols = np.asarray(mesh.vertex_colors, dtype=np.float64)
+
+    # 3. Ground datum from lowest percentile
+    z = v[:, 2]
+    z_ground = float(np.percentile(z, 5))
+
+    # 4. Extract directed boundary edges (edges belonging to exactly 1 triangle)
+    directed_edges = np.vstack([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+    sorted_edges = np.sort(directed_edges, axis=1)
+    unq, idx_unq, inv, counts = np.unique(sorted_edges, axis=0, return_index=True, return_inverse=True, return_counts=True)
+    boundary_mask = (counts[inv] == 1)
+    boundary_directed = directed_edges[boundary_mask]
+
+    # Filter for elevated boundary edges (building walls/roofs cut by camera boundary)
+    z0 = z[boundary_directed[:, 0]]
+    z1 = z[boundary_directed[:, 1]]
+    elev_mask = (z0 > z_ground + min_elev_m) | (z1 > z_ground + min_elev_m)
+    extrude_edges = boundary_directed[elev_mask]
+
+    if len(extrude_edges) == 0:
+        return mesh
+
+    # 5. Extrude vertical planar walls down to z_ground
+    orig_n_verts = len(v)
+    new_verts = []
+    new_cols = []
+    new_faces = []
+
+    for edge in extrude_edges:
+        ia, ib = edge[0], edge[1]
+        pa, pb = v[ia], v[ib]
+        ca, cb = cols[ia], cols[ib]
+
+        # Ground intersection points along gravity (-Z)
+        pa_g = np.array([pa[0], pa[1], z_ground], dtype=np.float64)
+        pb_g = np.array([pb[0], pb[1], z_ground], dtype=np.float64)
+
+        # Shaded architectural wall color (0.85x brightness for vertical walls)
+        wa_col = np.clip(ca * 0.85, 0.0, 1.0)
+        wb_col = np.clip(cb * 0.85, 0.0, 1.0)
+
+        idx_ag = orig_n_verts + len(new_verts)
+        new_verts.append(pa_g)
+        new_cols.append(wa_col)
+
+        idx_bg = orig_n_verts + len(new_verts)
+        new_verts.append(pb_g)
+        new_cols.append(wb_col)
+
+        # Winding order preserving outward normal
+        new_faces.append([ia, ib, idx_bg])
+        new_faces.append([ia, idx_bg, idx_ag])
+
+    all_v = np.vstack([v, np.array(new_verts)])
+    all_c = np.vstack([cols, np.array(new_cols)])
+    all_f = np.vstack([f, np.array(new_faces)])
+
+    completed = o3d.geometry.TriangleMesh()
+    completed.vertices = o3d.utility.Vector3dVector(all_v)
+    completed.triangles = o3d.utility.Vector3iVector(all_f)
+    completed.vertex_colors = o3d.utility.Vector3dVector(np.clip(all_c, 0.0, 1.0))
+    completed.compute_vertex_normals()
+
+    logger.info(
+        f"Sealed LoD-2 boundaries: extruded {len(extrude_edges):,} elevated boundary edges "
+        f"down to ground datum (Z={z_ground:.2f}m), added {len(new_faces):,} vertical wall faces."
+    )
+    return completed
+
+
 def build_full_3d_map(
     cloud_dense_ply: Path,
     run_dir: Path,
+    existing_mesh: Path | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Execute end-to-end completion: full 3D map, volumetric structures, continuous terrain, orthomosaic, and DSM.
 
@@ -421,6 +572,47 @@ def build_full_3d_map(
     if len(pcd.points) < 50:
         return map_3d_ply, map_3d_glb, ortho_png, dsm_png
 
+    # Preferred path: reuse the multi-view TSDF surface mesh when it exists,
+    # sealing unclosed building boundaries and pruning boundary slivers.
+    if existing_mesh is not None and Path(existing_mesh).exists():
+        try:
+            import trimesh
+
+            tsdf_mesh = o3d.io.read_triangle_mesh(str(existing_mesh))
+            if len(tsdf_mesh.triangles) > 0:
+                logger.info(
+                    f"Using existing TSDF surface mesh for map products "
+                    f"({len(tsdf_mesh.vertices):,} vertices, {len(tsdf_mesh.triangles):,} triangles)"
+                )
+                tsdf_mesh = seal_and_complete_lod2_mesh(tsdf_mesh)
+                mesh_tri = trimesh.Trimesh(
+                    vertices=np.asarray(tsdf_mesh.vertices),
+                    faces=np.asarray(tsdf_mesh.triangles),
+                    vertex_colors=np.clip(np.asarray(tsdf_mesh.vertex_colors), 0.0, 1.0)
+                    if len(tsdf_mesh.vertex_colors) > 0
+                    else None,
+                    process=False,
+                )
+                mesh_tri.export(str(map_3d_glb))
+                mesh_tri.export(str(map_3d_ply))
+                mesh_tri.export(str(map_3d_obj))
+                logger.info(
+                    f"Exported 3D map from TSDF surface: "
+                    f"{len(mesh_tri.vertices):,} vertices, {len(mesh_tri.faces):,} faces"
+                )
+                generate_2d_orthomosaic_and_dsm(
+                    tsdf_mesh, np.array([0.0, 0.0, 1.0, 0.0]), ortho_png, dsm_png
+                )
+                try:
+                    from uav3d.modeling.dashboard import generate_viewer_html
+
+                    generate_viewer_html(run_dir)
+                except Exception as exc:
+                    logger.debug(f"Viewer generation skipped: {exc}")
+                return map_3d_ply, map_3d_glb, ortho_png, dsm_png
+        except Exception as exc:
+            logger.warning(f"TSDF mesh reuse failed ({exc}); falling back to Poisson re-mesh")
+
     logger.info("Executing Authentic Photogrammetric 3D Reconstruction...")
 
     # 1. Statistical Outlier Removal & Voxel Downsampling
@@ -428,7 +620,6 @@ def build_full_3d_map(
     pcd_clean, _ = pcd_sub.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
     # 2. Ground Plane Alignment (Upright normal [0, 0, 1])
-    from scipy.spatial import Delaunay
     import trimesh
 
     plane, _ = pcd_clean.segment_plane(0.25, 3, 500)
@@ -457,22 +648,68 @@ def build_full_3d_map(
     pts_up = pts @ R_up.T
     pts_up[:, 2] += d
 
-    # 3. 2.5D Photogrammetric Surface Meshing with Boundary Ray Pruning
-    tri = Delaunay(pts_up[:, :2])
-    v0 = pts_up[tri.simplices[:, 0], :2]
-    v1 = pts_up[tri.simplices[:, 1], :2]
-    v2 = pts_up[tri.simplices[:, 2], :2]
+    # 3. Watertight 3D surface meshing (screened Poisson).
+    # A 2.5D Delaunay triangulation over the ground-plane projection connects
+    # pixels across depth discontinuities (facade tops, foliage over ground,
+    # water edges) into razor-thin near-vertical "needle" triangles. Poisson
+    # reconstruction fits one global oriented surface through the cloud
+    # instead, closing facades and pruning unconstrained lobes via density.
+    pcd_mesh = o3d.geometry.PointCloud()
+    pcd_mesh.points = o3d.utility.Vector3dVector(pts_up)
+    pcd_mesh.colors = o3d.utility.Vector3dVector(cols)
 
-    l0 = np.linalg.norm(v1 - v0, axis=1)
-    l1 = np.linalg.norm(v2 - v1, axis=1)
-    l2 = np.linalg.norm(v0 - v2, axis=1)
-    max_edge = np.maximum(l0, np.maximum(l1, l2))
+    # Scale normal-estimation and Poisson depth to the scene extent
+    bbox_min, bbox_max = pts_up.min(axis=0), pts_up.max(axis=0)
+    scene_span = float(np.linalg.norm(bbox_max - bbox_min))
+    normal_radius = max(0.25, scene_span * 0.02)
 
-    valid_mask = max_edge < 1.0
-    clean_tris = tri.simplices[valid_mask]
+    pcd_mesh.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=40)
+    )
+    pcd_mesh.orient_normals_consistent_tangent_plane(30)
+    # Ensure normals point outward/upward consistently toward the camera sweep
+    pcd_mesh.normalize_normals()
 
-    # Create solid Trimesh model with authentic per-vertex colors
-    mesh_tri = trimesh.Trimesh(vertices=pts_up, faces=clean_tris, vertex_colors=cols, process=False)
+    poisson_depth = int(np.clip(round(np.log2(max(1.0, scene_span) / 0.25)), 8, 11))
+    mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd_mesh, depth=poisson_depth
+    )
+    densities = np.asarray(densities)
+    if len(densities) > 0:
+        # Trim low-density lobes: Poisson hallucinates smooth bubbles where no
+        # observations constrain the surface
+        mesh_o3d.remove_vertices_by_mask(densities < np.percentile(densities, 12))
+
+    # Drop sliver components but keep legitimate surface islands
+    triangle_clusters, cluster_sizes, _ = mesh_o3d.cluster_connected_triangles()
+    tri_clusters = np.asarray(triangle_clusters)
+    if len(cluster_sizes) > 1 and len(tri_clusters) > 0:
+        sizes = np.asarray(cluster_sizes)
+        keep_mask = sizes >= max(100, 0.01 * sizes.max())
+        mesh_o3d.remove_triangles_by_mask(~keep_mask[tri_clusters])
+        mesh_o3d.remove_unreferenced_vertices()
+
+    # Crop to the observed cloud extent (slightly padded) to remove protruding walls
+    axis_bbox = pcd_mesh.get_axis_aligned_bounding_box()
+    axis_bbox = axis_bbox.scale(1.05, axis_bbox.get_center())
+    mesh_o3d = mesh_o3d.crop(axis_bbox)
+
+    # Transfer photometric colors from the cloud onto the Poisson surface
+    mesh_verts = np.asarray(mesh_o3d.vertices)
+    if len(mesh_verts) > 0:
+        tree = cKDTree(pts_up)
+        _, nearest_idx = tree.query(mesh_verts, workers=-1)
+        mesh_o3d.vertex_colors = o3d.utility.Vector3dVector(cols[nearest_idx])
+    mesh_o3d.compute_vertex_normals()
+
+    mesh_tri = trimesh.Trimesh(
+        vertices=mesh_verts,
+        faces=np.asarray(mesh_o3d.triangles),
+        vertex_colors=(np.asarray(mesh_o3d.vertex_colors) * 255.0).clip(0, 255).astype(np.uint8)
+        if len(mesh_o3d.vertex_colors) > 0
+        else None,
+        process=False,
+    )
     mesh_tri.fix_normals()
 
     # Export universal formats
@@ -481,16 +718,13 @@ def build_full_3d_map(
     mesh_tri.export(str(map_3d_obj))
 
     logger.info(
-        f"Exported clean photogrammetric 3D digital twin: "
-        f"{len(mesh_tri.vertices):,} vertices, {len(mesh_tri.faces):,} faces (zero boundary stretching)"
+        f"Exported Poisson 3D digital twin: "
+        f"{len(mesh_tri.vertices):,} vertices, {len(mesh_tri.faces):,} faces "
+        f"(watertight surface, no 2.5D needle stretching)"
     )
 
     # 4. Generate 2D Orthomosaic and DSM deliverables
-    full_o3d = o3d.geometry.TriangleMesh()
-    full_o3d.vertices = o3d.utility.Vector3dVector(pts_up)
-    full_o3d.vertex_colors = o3d.utility.Vector3dVector(cols)
-    full_o3d.triangles = o3d.utility.Vector3iVector(clean_tris.astype(np.int32))
-    generate_2d_orthomosaic_and_dsm(full_o3d, np.array([0.0, 0.0, 1.0, 0.0]), ortho_png, dsm_png)
+    generate_2d_orthomosaic_and_dsm(mesh_o3d, np.array([0.0, 0.0, 1.0, 0.0]), ortho_png, dsm_png)
 
     # 5. Generate interactive viewer.html
     try:

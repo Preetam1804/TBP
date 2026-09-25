@@ -245,21 +245,27 @@ def _resolve_calibration(
     if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
         w = actual_width or 1920
         h = actual_height or 1080
-        fx = fy = float(w) * 0.9
+        # SIMPLE_PINHOLE (f, cx, cy): one shared focal length. Video runs refine
+        # intrinsics during BA, and with PINHOLE's independent fx/fy the
+        # forward-flight focal/depth ambiguity can run fx/fy apart by orders of
+        # magnitude (observed: fx=21324 vs fy=1314), which freezes registration
+        # and shrinks the model to a fraction of the flight.
+        f0 = float(w) * 0.9
         cx = float(w) / 2.0
         cy = float(h) / 2.0
         calibration = CameraCalibration(
-            model="PINHOLE",
+            model="SIMPLE_PINHOLE",
             width=w,
             height=h,
-            params=[fx, fy, cx, cy],
+            params=[f0, cx, cy],
             source=f"auto_video_{w}x{h}",
         )
-        cfg.sfm.camera_model = "PINHOLE"
+        cfg.sfm.camera_model = "SIMPLE_PINHOLE"
         cfg.sfm.refine_intrinsics = True
         logger.info(
-            f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
-            f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
+            f"Auto-configured SIMPLE_PINHOLE calibration for video ({w}x{h}): "
+            f"f={f0:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True; "
+            "shared focal prevents fx/fy degeneracy on forward flight)"
         )
     else:
         source = _build_source(cfg, data_dir, args)

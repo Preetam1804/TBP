@@ -102,7 +102,10 @@ def export_model(
         try:
             from uav3d.modeling.completion import build_full_3d_map
 
-            m_ply, m_glb, o_png, d_png = build_full_3d_map(cloud_dense_ply, run_path)
+            tsdf_mesh = mesh_ply if mesh_ply and mesh_ply.exists() else None
+            m_ply, m_glb, o_png, d_png = build_full_3d_map(
+                cloud_dense_ply, run_path, existing_mesh=tsdf_mesh
+            )
             if m_ply.exists():
                 map_3d_ply = m_ply
             if m_glb.exists():
@@ -192,10 +195,22 @@ def _filter_point_cloud_outliers(model_ply: Path) -> int:
 def _generate_dense_model_and_mesh(run_path: Path) -> tuple[Path | None, Path | None, Path | None]:
     """Generate dense point cloud (cloud_dense.ply) and surface mesh (mesh.ply).
 
-    Uses DepthAnything-V2-Small if available, or surface Poisson reconstruction.
+    Primary path: multi-view TSDF fusion with robust disparity alignment
+    (uav3d.modeling.dense). Falls back to the legacy per-frame backprojection
+    when TSDF fusion cannot run (missing checkpoint/model) or produces no mesh.
     Returns:
         (mesh_ply, mesh_decimated_ply, cloud_dense_ply)
     """
+    try:
+        from uav3d.modeling.dense import generate_dense_and_mesh_tsdf
+
+        result = generate_dense_and_mesh_tsdf(run_path)
+        if result is not None and any(p is not None for p in result):
+            return result
+        logger.info("TSDF dense fusion unavailable; using legacy backprojection path")
+    except Exception as exc:
+        logger.warning(f"TSDF dense fusion failed ({exc}); using legacy backprojection path")
+
     mesh_ply = run_path / "mesh.ply"
     mesh_decimated_ply = run_path / "mesh_decimated.ply"
     cloud_dense_ply = run_path / "cloud_dense.ply"
@@ -221,9 +236,16 @@ def _generate_dense_model_and_mesh(run_path: Path) -> tuple[Path | None, Path | 
 
         cam_info = poses_data.get("camera", {})
         params = cam_info.get("params", [])
-        if len(params) < 4:
+        if not params:
             return None, None, None
-        fx, fy, cx, cy = params[:4]
+        if len(params) == 3:
+            # SIMPLE_PINHOLE: [f, cx, cy] — shared focal length
+            fx = fy = float(params[0])
+            cx, cy = float(params[1]), float(params[2])
+        elif len(params) >= 4:
+            fx, fy, cx, cy = (float(v) for v in params[:4])
+        else:
+            return None, None, None
         width = cam_info.get("width", 1920)
         height = cam_info.get("height", 1080)
 
@@ -275,8 +297,14 @@ def _generate_dense_model_and_mesh(run_path: Path) -> tuple[Path | None, Path | 
             target_h = 384
             w_sub = max(64, int(round(target_h * (width / height))))
             h_sub = target_h
-            u = np.linspace(0, width - 1, w_sub)
-            v = np.linspace(0, height - 1, h_sub)
+            # Pixel-center grid in FULL-RES coordinates: working pixel i covers
+            # full-res [i*scale, (i+1)*scale); its center maps to full-res
+            # (i+0.5)*scale-0.5. (The previous linspace grid mixed working-res
+            # coordinates with full-res cx/cy, skewing points off-axis.)
+            scale_u = width / float(w_sub)
+            scale_v = height / float(h_sub)
+            u = (np.arange(w_sub, dtype=np.float64) + 0.5) * scale_u - 0.5
+            v = (np.arange(h_sub, dtype=np.float64) + 0.5) * scale_v - 0.5
             uu, vv = np.meshgrid(u, v)
 
             for p in poses:

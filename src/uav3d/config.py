@@ -47,7 +47,26 @@ class SfmConfig(BaseModel):
     max_image_size: int = Field(default=1600, gt=0, description="Maximum image dimension for feature extraction")
     refine_intrinsics: bool = Field(default=False, description="Whether to refine camera intrinsics during bundle adjustment")
     feature_type: str = Field(default="SIFT", description="Feature extractor type")
-    matcher_type: str = Field(default="sequential", description="COLMAP matcher type (sequential or exhaustive)")
+    matcher_type: str = Field(default="sequential", description="COLMAP matcher type (sequential, exhaustive, or vocabtree)")
+    video_matcher_type: str = Field(
+        default="exhaustive",
+        description=(
+            "Matcher used for video runs when keyframe count <= exhaustive_max_images. "
+            "Forward-flight video provides little parallax and no loop closures; "
+            "sequential-only matching drops the rest of the scene."
+        ),
+    )
+    exhaustive_max_images: int = Field(
+        default=120,
+        ge=2,
+        description="Max keyframes for exhaustive matching (n*(n-1)/2 pairs; 120 images = 7140 pairs).",
+    )
+    loop_detection: bool = Field(
+        default=False,
+        description="Enable sequential-matcher loop detection (requires vocab_tree_path for best results).",
+    )
+    loop_detection_period: int = Field(default=10, ge=1, description="Insert loop-closure candidates every N images.")
+    vocab_tree_path: str | None = Field(default=None, description="Optional vocab-tree file for loop/vocabtree matching.")
     min_num_matches: int = Field(default=15, ge=1, description="Minimum inlier matches for pair")
     init_min_inliers: int = Field(default=15, ge=1, description="Minimum inliers for initial pair")
     init_min_tri_angle: float = Field(default=2.0, ge=0.0, description="Minimum triangulation angle for initial pair in degrees")

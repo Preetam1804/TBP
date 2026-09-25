@@ -27,3 +27,12 @@ data/
 !data/.gitkeep
 !data/raw/.gitkeep
 !data/interim/.gitkeep
+
+# Scratch and debug artifacts
+debug/
+*.png
+models/checkpoints/*.onnx
+models/checkpoints/*.onnx.sha256
+*.docx_backup
+*_backup.docx
+*.mtl

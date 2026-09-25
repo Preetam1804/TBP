@@ -86,9 +86,15 @@ def compute_sample_reprojection_errors(
                 if hasattr(camera, "img_from_cam"):
                     proj_uv = np.array(camera.img_from_cam(p_cam), dtype=np.float64)
                 else:
-                    # Generic pinhole fallback
-                    fx, fy = float(camera.params[0]), float(camera.params[1])
-                    cx, cy = float(camera.params[2]), float(camera.params[3])
+                    # Generic pinhole fallback (handles SIMPLE_PINHOLE 3-param
+                    # model: params = [f, cx, cy] with fx == fy == f)
+                    if len(camera.params) == 3:
+                        f = float(camera.params[0])
+                        fx = fy = f
+                        cx, cy = float(camera.params[1]), float(camera.params[2])
+                    else:
+                        fx, fy = float(camera.params[0]), float(camera.params[1])
+                        cx, cy = float(camera.params[2]), float(camera.params[3])
                     proj_uv = np.array([fx * p_cam[0] / p_cam[2] + cx, fy * p_cam[1] / p_cam[2] + cy])
 
                 # Get observed 2D point

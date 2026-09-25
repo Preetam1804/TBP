@@ -59,6 +59,15 @@ uv run pytest
 The suite renders a deterministic synthetic parallax video on the fly
 (`scripts/make_parallax_video.py`), so no downloaded data is required.
 
+### Test videos for judging 3D model quality
+
+See [TEST_VIDEOS.md](TEST_VIDEOS.md). TL;DR: `data/raw/test_videos/` holds a
+synthetic city flyover **with 3D ground truth** (`scripts/make_city_flyover_video.py`;
+compare `model.ply` against `city_flyover.gt_model.ply`, and `--gt-file` gives a
+true-scale ATE report) plus a known-good baseline video in the Zurich layout,
+public dataset links, and a field-capture checklist for why a given
+single-pass video may fail SfM (motion blur, overlap, texture, pure rotation).
+
 ## Attribution
 
 Zurich Urban MAV Dataset:

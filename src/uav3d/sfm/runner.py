@@ -49,6 +49,88 @@ class SfmRunner:
     def __init__(self, config: SfmConfig | None = None) -> None:
         self.config = config or SfmConfig()
 
+    def _run_matching_stage(
+        self,
+        database_path: Path,
+        image_files: list[str],
+        native_log_path: str | Path,
+    ) -> SfmStageProfile:
+        """Run the configured feature-matching stage.
+
+        Strategy dispatch: video-style runs (small, unordered-ish keyframe sets
+        captured along one flight path) benefit enormously from exhaustive
+        matching — forward flight provides no loop closures, so pure sequential
+        matching leaves the far end of the flight disconnected and COLMAP
+        discards it. Exhaustive on <=120 keyframes is ~7k pairs, well bounded.
+        """
+        t0 = time.perf_counter()
+        n = len(image_files)
+        n_pairs = n * (n - 1) // 2
+
+        tvg_opts = pycolmap.TwoViewGeometryOptions()
+        if self.config.ignore_watermarks:
+            tvg_opts.detect_watermark = False
+
+        matcher = self.config.matcher_type.lower()
+        if self.config.video_matcher_type and 2 <= n <= self.config.exhaustive_max_images:
+            matcher = self.config.video_matcher_type.lower()
+
+        if matcher not in {"sequential", "exhaustive", "vocabtree"}:
+            raise Uav3dError(
+                f"Unknown matcher_type '{self.config.matcher_type}'. Use 'sequential', 'exhaustive', or 'vocabtree'."
+            )
+
+        if matcher == "exhaustive":
+            logger.info(
+                f"Stage 3/4: Exhaustive feature matching ({n} images = {n_pairs} pairs; "
+                "captures loop closures a forward flight never produces)"
+            )
+            with NativeStderrCapture(native_log_path):
+                try:
+                    pycolmap.match_exhaustive(str(database_path), verification_options=tvg_opts)
+                except Exception as exc:
+                    raise Uav3dError(f"Exhaustive feature matching failed: {exc}") from exc
+        elif matcher == "vocabtree":
+            if not self.config.vocab_tree_path or not Path(self.config.vocab_tree_path).exists():
+                raise Uav3dError(
+                    f"matcher_type='vocabtree' requires vocab_tree_path pointing at a valid tree file "
+                    f"(got: {self.config.vocab_tree_path!r})."
+                )
+            logger.info(f"Stage 3/4: Vocab-tree feature matching ({n} images)")
+            vt_opts = pycolmap.VocabTreeMatchingOptions()
+            vt_opts.vocab_tree_path = self.config.vocab_tree_path
+            with NativeStderrCapture(native_log_path):
+                try:
+                    pycolmap.match_vocabtree(str(database_path), matching_options=vt_opts, verification_options=tvg_opts)
+                except Exception as exc:
+                    raise Uav3dError(f"Vocab-tree feature matching failed: {exc}") from exc
+        else:
+            logger.info(f"Stage 3/4: Sequential feature matching (overlap={self.config.seq_overlap})")
+            seq_opts = pycolmap.SequentialMatchingOptions()
+            seq_opts.overlap = self.config.seq_overlap
+            if self.config.loop_detection:
+                seq_opts.loop_detection = True
+                seq_opts.loop_detection_period = self.config.loop_detection_period
+                if self.config.vocab_tree_path and Path(self.config.vocab_tree_path).exists():
+                    seq_opts.vocab_tree_path = self.config.vocab_tree_path
+                    logger.info(f"  Loop detection enabled (period={self.config.loop_detection_period}, vocab tree)")
+                else:
+                    logger.info(
+                        "  Loop detection enabled without vocab_tree_path: COLMAP requires "
+                        "a vocab tree for ranking candidates; pass vocab_tree_path for it to take effect."
+                    )
+            with NativeStderrCapture(native_log_path):
+                try:
+                    pycolmap.match_sequential(str(database_path), matching_options=seq_opts, verification_options=tvg_opts)
+                except Exception as exc:
+                    raise Uav3dError(f"Sequential feature matching failed: {exc}") from exc
+
+        return SfmStageProfile(
+            stage_name=f"feature_matching_{matcher}",
+            wall_time_s=time.perf_counter() - t0,
+            peak_rss_mb=get_peak_rss_mb(),
+        )
+
     def run(
         self,
         images_dir: str | Path,
@@ -178,28 +260,10 @@ class SfmRunner:
         )
 
         # -------------------------------------------------------------
-        # Stage 3: Sequential Feature Matching
+        # Stage 3: Feature Matching (sequential / exhaustive / loop-closure)
         # -------------------------------------------------------------
         t0 = time.perf_counter()
-        logger.info(f"Stage 3/4: Sequential feature matching (overlap={self.config.seq_overlap})")
-
-        seq_opts = pycolmap.SequentialMatchingOptions()
-        seq_opts.overlap = self.config.seq_overlap
-
-        tvg_opts = pycolmap.TwoViewGeometryOptions()
-        if self.config.ignore_watermarks:
-            tvg_opts.detect_watermark = False
-
-        with NativeStderrCapture(native_log_path):
-            try:
-                pycolmap.match_sequential(
-                    str(database_path),
-                    matching_options=seq_opts,
-                    verification_options=tvg_opts,
-                )
-            except Exception as exc:
-                raise Uav3dError(f"Sequential feature matching failed: {exc}") from exc
-
+        self._run_matching_stage(database_path, image_files, native_log_path)
         profiles.append(
             SfmStageProfile(
                 stage_name="feature_matching",
