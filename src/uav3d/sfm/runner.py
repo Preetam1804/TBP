@@ -12,7 +12,9 @@ from uav3d.config import SfmConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.models.frames import CameraCalibration
 from uav3d.sfm.colmap_compat import get_peak_rss_mb
+from uav3d.sfm.focal_search import FocalSearchResult, continue_to_focal, search_focal
 from uav3d.sfm.native_log import NativeStderrCapture
+from uav3d.sfm.vp_focal import estimate_focal_from_vanishing_points
 
 logger = logging.getLogger("uav3d.sfm.runner")
 
@@ -41,6 +43,9 @@ class SfmRunResult:
     profiles: list[SfmStageProfile]
     total_wall_time_s: float
     peak_rss_mb: float
+    focal_search: FocalSearchResult | None = None
+    intrinsics_note: str | None = None
+    intrinsics_info: dict | None = None
 
 
 class SfmRunner:
@@ -68,6 +73,13 @@ class SfmRunner:
         n_pairs = n * (n - 1) // 2
 
         tvg_opts = pycolmap.TwoViewGeometryOptions()
+        # Apply the configured geometric quality gate before verified pairs can
+        # seed or contaminate incremental mapping.
+        tvg_opts.min_num_inliers = self.config.min_num_matches
+        # Keep COLMAP's established pixel tolerance; the inlier-count gate is
+        # the useful quality control here and a tighter threshold breaks small
+        # or compressed drone clips before SfM can initialize.
+        tvg_opts.ransac.max_error = 4.0
         if self.config.ignore_watermarks:
             tvg_opts.detect_watermark = False
 
@@ -187,6 +199,52 @@ class SfmRunner:
         overall_start = time.perf_counter()
 
         # -------------------------------------------------------------
+        # Stage 0: Focal length from vanishing points (unknown-intrinsics video)
+        # -------------------------------------------------------------
+        refine_intrinsics = self.config.refine_intrinsics
+        vp_accepted = False
+        intrinsics_note: str | None = None
+        intrinsics_info: dict | None = None
+        if self.config.vp_focal and "SIMPLE" in self.config.camera_model.upper():
+            t0 = time.perf_counter()
+            vp = estimate_focal_from_vanishing_points(
+                [img_path / n for n in image_files], max_frames=self.config.vp_max_frames
+            )
+            if vp is not None and vp.is_reliable(
+                min_frames=self.config.vp_min_frames, max_spread=self.config.vp_max_spread
+            ):
+                prior_f = float(calibration.params[0])
+                calibration = calibration.model_copy(update={"params": [vp.focal_px, *calibration.params[1:]]})
+                refine_intrinsics = False
+                vp_accepted = True
+                intrinsics_note = (
+                    f"focal length {vp.focal_px:.0f} px estimated from vanishing points of orthogonal scene "
+                    f"lines ({vp.num_frames} frames agree, scatter {vp.spread:.1%}) and held fixed; "
+                    f"forward-flight bundle adjustment cannot observe it (generic prior was {prior_f:.0f} px)"
+                )
+                intrinsics_info = {
+                    "method": "vanishing_points",
+                    "prior_focal_px": round(prior_f, 2),
+                    "selected_focal_px": round(vp.focal_px, 2),
+                    "focal_observable": False,
+                    "vanishing_points": vp.as_dict(),
+                }
+                logger.info(f"Intrinsics: {intrinsics_note}")
+            else:
+                logger.info(
+                    "Vanishing-point focal estimate "
+                    + ("unreliable" if vp is not None else "unavailable")
+                    + f" ({vp.as_dict() if vp else 'too few orthogonal line pairs'}); falling back to trial search"
+                )
+            profiles.append(
+                SfmStageProfile(
+                    stage_name="vp_focal",
+                    wall_time_s=time.perf_counter() - t0,
+                    peak_rss_mb=get_peak_rss_mb(),
+                )
+            )
+
+        # -------------------------------------------------------------
         # Stage 1: Feature Extraction
         # -------------------------------------------------------------
         t0 = time.perf_counter()
@@ -194,6 +252,7 @@ class SfmRunner:
 
         sift_opts = pycolmap.SiftExtractionOptions()
         sift_opts.max_image_size = self.config.max_image_size
+        sift_opts.max_num_features = 12000
 
         reader_opts = pycolmap.ImageReaderOptions()
         reader_opts.camera_model = self.config.camera_model
@@ -263,7 +322,7 @@ class SfmRunner:
         # Stage 3: Feature Matching (sequential / exhaustive / loop-closure)
         # -------------------------------------------------------------
         t0 = time.perf_counter()
-        self._run_matching_stage(database_path, image_files, native_log_path)
+        matching_profile = self._run_matching_stage(database_path, image_files, native_log_path)
         profiles.append(
             SfmStageProfile(
                 stage_name="feature_matching",
@@ -271,6 +330,63 @@ class SfmRunner:
                 peak_rss_mb=get_peak_rss_mb(),
             )
         )
+
+        # -------------------------------------------------------------
+        # Stage 3b: Focal selection for unknown-intrinsics forward-flight video
+        # -------------------------------------------------------------
+        expected_params = list(calibration.params)
+        focal_result: FocalSearchResult | None = None
+        continuation_focal: float | None = None  # focal to carry the mapped model to after mapping
+        if (
+            self.config.focal_search
+            and matching_profile.stage_name.endswith("exhaustive")  # trial subsets need all-pairs matches
+            and total_images >= 4
+            and "SIMPLE" in self.config.camera_model.upper()
+        ):
+            t0 = time.perf_counter()
+            focal_result = search_focal(
+                database_path=database_path,
+                image_dir=img_path,
+                image_files=image_files,
+                prior_focal_px=float(calibration.params[0]),
+                cfg=self.config,
+                native_log_path=native_log_path,
+                probe_observability=not vp_accepted,
+            )
+            target_focal = float(calibration.params[0])
+            surrogate = focal_result.selected_focal_px
+            if surrogate != target_focal:
+                db = pycolmap.Database()
+                db.open(str(database_path))
+                try:
+                    for cam in db.read_all_cameras():
+                        cam.focal_length = surrogate
+                        db.update_camera(cam)
+                finally:
+                    db.close()
+            if vp_accepted:
+                # Focal is known (vanishing points): map where the mapper finds the good basin, then
+                # carry the model to the measured focal. Final intrinsics == target_focal.
+                if surrogate != target_focal:
+                    continuation_focal = target_focal
+                    intrinsics_note += (
+                        f"; COLMAP's mapper falls into a bent local minimum at that focal, so the model was "
+                        f"mapped at {surrogate:.0f} px (better fit) and bundle-adjusted to {target_focal:.0f} px"
+                    )
+                intrinsics_info["focal_search"] = focal_result.as_dict()
+            else:
+                expected_params[0] = surrogate
+                refine_intrinsics = focal_result.focal_observable
+                intrinsics_note = focal_result.note()
+                intrinsics_info = {"method": "trial_search", **focal_result.as_dict()}
+            logger.info(f"Intrinsics: {intrinsics_note}")
+            profiles.append(
+                SfmStageProfile(
+                    stage_name="focal_search",
+                    wall_time_s=time.perf_counter() - t0,
+                    peak_rss_mb=get_peak_rss_mb(),
+                )
+            )
 
         # -------------------------------------------------------------
         # Stage 4: Incremental Mapping with Locked Intrinsics
@@ -281,7 +397,7 @@ class SfmRunner:
         pipeline_opts = pycolmap.IncrementalPipelineOptions()
 
         # Lock camera intrinsics during bundle adjustment if configured
-        if not self.config.refine_intrinsics:
+        if not refine_intrinsics:
             pipeline_opts.ba_refine_focal_length = False
             pipeline_opts.ba_refine_principal_point = False
             pipeline_opts.ba_refine_extra_params = False
@@ -293,6 +409,11 @@ class SfmRunner:
         pipeline_opts.mapper.init_min_tri_angle = self.config.init_min_tri_angle
         pipeline_opts.mapper.init_min_num_inliers = self.config.init_min_inliers
         pipeline_opts.mapper.abs_pose_min_num_inliers = self.config.abs_pose_min_inliers
+        # Global refinement stabilizes drift across long flights without excessive churn
+        pipeline_opts.ba_local_max_num_iterations = 40
+        pipeline_opts.ba_global_max_num_iterations = 80
+        pipeline_opts.ba_global_max_refinements = 5
+        pipeline_opts.ba_global_frames_ratio = 1.2
         pipeline_opts.min_model_size = self.config.min_model_size
         pipeline_opts.ignore_watermarks = self.config.ignore_watermarks
 
@@ -354,6 +475,14 @@ class SfmRunner:
                 "Set sfm.multiple_models=true to allow secondary model attempts."
             )
 
+        if continuation_focal is not None:
+            before = float(selected_rec.compute_mean_reprojection_error())
+            after = continue_to_focal(selected_rec, continuation_focal)
+            logger.info(
+                f"Carried model to the measured focal {continuation_focal:.1f} px by fixed-intrinsics BA: "
+                f"reproj {before:.3f} -> {after:.3f} px"
+            )
+
         reg_rate = float(num_reg / max(1, total_images))
         mean_reproj = (
             float(selected_rec.compute_mean_reprojection_error())
@@ -364,17 +493,17 @@ class SfmRunner:
         # Assert and verify locked intrinsics post-bundle adjustment
         for cam_id, cam in selected_rec.cameras.items():
             actual_params = np.array(cam.params, dtype=np.float64)
-            expected_params = np.array(calibration.params, dtype=np.float64)
+            expected = np.array(expected_params, dtype=np.float64)
 
             logger.info(
                 f"Camera #{cam_id} post-BA parameters: {actual_params.tolist()} "
-                f"(expected: {expected_params.tolist()})"
+                f"(expected: {expected.tolist()})"
             )
 
-            if not self.config.refine_intrinsics and not np.allclose(actual_params, expected_params, atol=1e-3):
+            if not refine_intrinsics and not np.allclose(actual_params, expected, atol=1e-3):
                     raise Uav3dError(
                         f"Camera intrinsics were modified during bundle adjustment despite refine_intrinsics=False! "
-                        f"Expected: {expected_params.tolist()}, Got: {actual_params.tolist()}"
+                        f"Expected: {expected.tolist()}, Got: {actual_params.tolist()}"
                     )
 
         overall_time = time.perf_counter() - overall_start
@@ -397,4 +526,7 @@ class SfmRunner:
             profiles=profiles,
             total_wall_time_s=overall_time,
             peak_rss_mb=peak_rss,
+            focal_search=focal_result,
+            intrinsics_note=intrinsics_note,
+            intrinsics_info=intrinsics_info,
         )

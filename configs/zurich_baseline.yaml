@@ -40,7 +40,7 @@ sfm:
   # forward flight gives no loop closures, so sequential-only matching drops
   # the far end of the flight from the model.
   video_matcher_type: "exhaustive"
-  exhaustive_max_images: 120
+  exhaustive_max_images: 180
   loop_detection: false
   loop_detection_period: 10
   vocab_tree_path: null

@@ -1,6 +1,7 @@
 """Command-line interface for the uav3d pipeline."""
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -43,7 +44,7 @@ DEFAULT_LABEL = "replayed public dataset"
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    """Attach standard --config, --data-dir, and --video flags to a subcommand parser."""
+    """Attach standard --config, --data-dir, --dataset-dir, and --video flags to a subcommand parser."""
     parser.add_argument(
         "--config",
         type=str,
@@ -55,6 +56,18 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="Data directory root (overrides config data_dir and UAV3D_DATA_DIR env var)",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=str,
+        default=None,
+        help="Path directly to dataset directory (e.g. data/raw/zurich_mav_real)",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="Number of frames or slice count to evaluate/process",
     )
     parser.add_argument(
         "--video",
@@ -75,14 +88,22 @@ def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) 
 
     source_type = cfg.source.type.lower()
     if source_type == "zurich":
-        dataset_path = Path(args.data_dir) if args.data_dir else Path(cfg.source.dataset_dir)
-        if not dataset_path.is_absolute():
-            dataset_path = (Path(data_dir).parent / dataset_path).resolve() if not dataset_path.exists() else dataset_path.resolve()
+        dataset_dir_cli = getattr(args, "dataset_dir", None)
+        if dataset_dir_cli:
+            dataset_path = Path(dataset_dir_cli).resolve()
+        elif args.data_dir:
+            dataset_path = Path(args.data_dir).resolve()
+        else:
+            dataset_path = Path(cfg.source.dataset_dir)
+            if not dataset_path.is_absolute():
+                dataset_path = (Path(data_dir).parent / dataset_path).resolve() if not dataset_path.exists() else dataset_path.resolve()
+
+        count_cli = getattr(args, "count", None) or cfg.source.count
 
         return ZurichSequenceSource(
             dataset_dir=dataset_path,
             start_id=cfg.source.start_id,
-            count=cfg.source.count,
+            count=count_cli,
             stride=cfg.source.stride,
         )
     if source_type == "video":
@@ -134,6 +155,7 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
             f"{[round(p, 2) for p in calib.params]}",
         )
 
+        lats, lons, alts = [], [], []
         if isinstance(source, ZurichSequenceSource):
             table.add_row("Telemetry GPS Records", f"{source.total_gps_count:,}")
             table.add_row("Ground Truth Records (EVAL)", f"{source.total_gt_count:,} [yellow](eval only)[/yellow]")
@@ -148,6 +170,70 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
                 table.add_row("Longitude Range", f"[{min(lons):.6f}, {max(lons):.6f}]")
             if alts:
                 table.add_row("Altitude Range (m)", f"[{min(alts):.2f}, {max(alts):.2f}]")
+
+        # Save artifacts if requested or if output directory provided
+        save_dir = (
+            getattr(args, "out", None)
+            or getattr(args, "run_dir", None)
+            or getattr(args, "output_dir", None)
+        )
+        if save_dir or getattr(args, "save", False):
+            target_dir = Path(save_dir).resolve() if save_dir else Path(data_dir) / "outputs" / "inspect"
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            report_data = {
+                "schema_version": "1.0.0",
+                "dataset_label": cfg.dataset_label,
+                "source_name": meta.name,
+                "source_type": source_type,
+                "frame_count": meta.frame_count,
+                "resolution": {"width": meta.width, "height": meta.height},
+                "fps": meta.fps,
+                "first_frame_id": meta.first_frame_id,
+                "last_frame_id": meta.last_frame_id,
+                "first_timestamp_us": meta.first_timestamp_us,
+                "last_timestamp_us": meta.last_timestamp_us,
+                "camera_calibration": {
+                    "model": calib.model,
+                    "source": calib.source,
+                    "parameters": calib.params,
+                },
+                "telemetry": {
+                    "gps_records_count": len(lats) if lats else 0,
+                    "lat_range": [min(lats), max(lats)] if lats else None,
+                    "lon_range": [min(lons), max(lons)] if lons else None,
+                    "alt_range_m": [min(alts), max(alts)] if alts else None,
+                },
+                "ground_truth": {
+                    "records_count": getattr(source, "total_gt_count", 0),
+                    "role": "evaluation_only_never_consumed_by_sfm",
+                },
+            }
+            json_path = target_dir / "inspection_report.json"
+            json_path.write_text(json.dumps(report_data, indent=2), encoding="utf-8")
+            table.add_row("Inspection JSON", str(json_path))
+
+            txt_path = target_dir / "inspection_summary.txt"
+            txt_content = (
+                f"=== UAV-3D Dataset Inspection Summary ===\n"
+                f"Source: {meta.name} ({source_type})\n"
+                f"Frames in slice: {meta.frame_count}\n"
+                f"Resolution: {meta.width}x{meta.height} (FPS: {meta.fps})\n"
+                f"Camera Model: {calib.model} ({calib.source})\n"
+                f"Intrinsics: {calib.params}\n"
+                f"Telemetry GPS records: {len(lats)}\n"
+                f"Ground Truth records: {getattr(source, 'total_gt_count', 0)} (EVALUATION ONLY)\n"
+                f"Dataset label: {cfg.dataset_label}\n"
+            )
+            txt_path.write_text(txt_content, encoding="utf-8")
+            table.add_row("Summary Text", str(txt_path))
+
+            if hasattr(source, "_gps_records") and source._gps_records:
+                from uav3d.visualization import generate_gps_overview_plot
+
+                plot_name = generate_gps_overview_plot(source._gps_records, target_dir)
+                if plot_name:
+                    table.add_row("GPS Overview Plot", str(target_dir / plot_name))
 
         console.print(table)
         console.print(
@@ -168,12 +254,21 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
 
     with timed_stage("keyframes", logger=logger):
         source = _build_source(cfg, data_dir, args)
-        timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
+        run_dir_arg = (
+            getattr(args, "out", None)
+            or getattr(args, "run_dir", None)
+            or getattr(args, "output_dir", None)
+        )
+        if run_dir_arg:
+            run_dir = Path(run_dir_arg).resolve()
+        else:
+            timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-        budget = getattr(args, "max_frames", None)
+        budget = getattr(args, "count", None) or getattr(args, "max_frames", None)
         if budget is not None:
-            cfg.keyframes.max_frames = min(cfg.keyframes.max_frames, budget)
+            cfg.keyframes.max_frames = budget
             cfg.ingest.max_frames = budget
         selector = KeyframeSelector(config=cfg.keyframes)
         summary = selector.select(
@@ -182,6 +277,10 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
             dataset_label=cfg.dataset_label,
             frame_budget=cfg.ingest.max_frames,
         )
+
+        from uav3d.visualization import generate_keyframe_quality_plots
+
+        plot_name = generate_keyframe_quality_plots(summary.keyframes_json_path, run_dir, min_blur=cfg.keyframes.min_blur)
 
         table = Table(title=f"Keyframe Extraction Summary: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
         table.add_column("Metric / Property", style="bold white", width=28)
@@ -207,6 +306,8 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         table.add_row("Keyframes JSON", str(summary.keyframes_json_path))
         table.add_row("SfM Images Directory", str(summary.sfm_images_dir))
         table.add_row("Contact Sheet", str(summary.contact_sheet_path))
+        if plot_name:
+            table.add_row("Quality Plots", str(run_dir / plot_name))
 
         console.print(table)
     return 0
@@ -250,7 +351,10 @@ def _resolve_calibration(
         # forward-flight focal/depth ambiguity can run fx/fy apart by orders of
         # magnitude (observed: fx=21324 vs fy=1314), which freezes registration
         # and shrinks the model to a fraction of the flight.
-        f0 = float(w) * 0.9
+        user_focal = getattr(args, "focal_px", None)
+        if user_focal is not None and user_focal <= 0:
+            raise Uav3dError(f"--focal-px must be positive (got {user_focal})")
+        f0 = float(user_focal) if user_focal else float(w) * 0.9
         cx = float(w) / 2.0
         cy = float(h) / 2.0
         calibration = CameraCalibration(
@@ -261,11 +365,21 @@ def _resolve_calibration(
             source=f"auto_video_{w}x{h}",
         )
         cfg.sfm.camera_model = "SIMPLE_PINHOLE"
-        cfg.sfm.refine_intrinsics = True
+        if user_focal:
+            # Caller-supplied focal: trust it and keep it fixed.
+            cfg.sfm.refine_intrinsics = False
+            cfg.sfm.focal_search = False
+            cfg.sfm.vp_focal = False
+        else:
+            cfg.sfm.refine_intrinsics = True
+            # Unknown intrinsics: pick the focal prior by trial reconstruction and only
+            # refine it when the data can observe it (see sfm/focal_search.py).
+            cfg.sfm.focal_search = True
+            cfg.sfm.vp_focal = True
         logger.info(
             f"Auto-configured SIMPLE_PINHOLE calibration for video ({w}x{h}): "
-            f"f={f0:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True; "
-            "shared focal prevents fx/fy degeneracy on forward flight)"
+            f"f={f0:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics={cfg.sfm.refine_intrinsics}, "
+            f"focal_search={cfg.sfm.focal_search}; shared focal prevents fx/fy degeneracy on forward flight)"
         )
     else:
         source = _build_source(cfg, data_dir, args)
@@ -275,16 +389,27 @@ def _resolve_calibration(
     return calibration
 
 
-def _find_ground_truth(data_dir: str, args: argparse.Namespace) -> Path | None:
+def _find_ground_truth(data_dir: str, args: argparse.Namespace, cfg: PipelineConfig | None = None) -> Path | None:
     """Locate GroundTruthAGL.csv (explicit --gt-file first, then standard dataset paths)."""
     if getattr(args, "gt_file", None):
         gt = Path(args.gt_file).resolve()
         return gt if gt.exists() else None
-    candidates = [
+    dataset_dir_arg = getattr(args, "dataset_dir", None)
+    candidates = []
+    if dataset_dir_arg:
+        p = Path(dataset_dir_arg).resolve()
+        candidates.extend([p / "Log Files" / "GroundTruthAGL.csv", p / "GroundTruthAGL.csv"])
+    if cfg and getattr(cfg, "source", None) and getattr(cfg.source, "dataset_dir", None):
+        cfg_p = Path(cfg.source.dataset_dir)
+        if not cfg_p.is_absolute():
+            cfg_p = (Path(data_dir).parent / cfg_p).resolve() if not cfg_p.exists() else cfg_p.resolve()
+        candidates.extend([cfg_p / "Log Files" / "GroundTruthAGL.csv", cfg_p / "GroundTruthAGL.csv"])
+    candidates.extend([
         Path(data_dir) / "raw" / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
+        Path(data_dir) / "raw" / "zurich_mav_real" / "Log Files" / "GroundTruthAGL.csv",
         Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
         Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
-    ]
+    ])
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -338,7 +463,7 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         runner = SfmRunner(config=cfg.sfm)
         result = runner.run(images_dir=images_dir, output_dir=run_dir, calibration=calibration)
 
-        # 6. Export poses.json
+        # 6. Export poses.json and 3D model
         poses_path = run_dir / "poses.json"
         poses_file = export_poses(
             reconstruction=result.reconstruction,
@@ -349,6 +474,24 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
             scale_factor=1.0,
             timestamps_map=timestamps_map,
         )
+
+        model_result = export_model(
+            reconstruction=result.reconstruction,
+            run_dir=run_dir,
+            dataset_label=cfg.dataset_label,
+            num_source_frames=result.total_images,
+            num_keyframes=result.total_images,
+            num_models=result.num_models,
+            mean_reprojection_error_px=result.mean_reprojection_error_px,
+            # Dense fusion is part of the quality-first reconstruction path.
+            # The old default silently produced sparse SfM only, even though
+            # the command is documented as video -> 3D model.
+            dense=getattr(args, "dense", True),
+        )
+
+        from uav3d.visualization import generate_sfm_preview_plot
+
+        sfm_plot_name = generate_sfm_preview_plot(poses_path, run_dir, ply_path=model_result.model_ply)
 
         # 7. Print summary table
         table = Table(
@@ -379,8 +522,12 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
         table.add_row("Total Wall Time", f"{result.total_wall_time_s:.2f}s")
         table.add_row("Peak Memory (RSS)", f"{result.peak_rss_mb:.1f} MB")
         table.add_row("Poses File", str(poses_path))
+        table.add_row("3D Point Cloud (model.ply)", str(model_result.model_ply))
+        table.add_row("Trajectory (trajectory.ply)", str(model_result.trajectory_ply))
+        table.add_row("COLMAP Sparse Model", str(model_result.model_dir))
         table.add_row("COLMAP Database", str(result.database_path))
-        table.add_row("Sparse Reconstruction", str(result.sparse_dir))
+        if sfm_plot_name:
+            table.add_row("SfM Preview Plot", str(run_dir / sfm_plot_name))
         table.add_row(
             "Intrinsics Locked",
             f"{poses_file.camera.params if poses_file.camera else calibration.params}",
@@ -426,8 +573,11 @@ def _handle_reconstruct_command(args: argparse.Namespace) -> int:
         if dataset_label is None:
             dataset_label = VIDEO_FIELD_LABEL if is_video else cfg.dataset_label
 
-        timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
+        if getattr(args, "run_dir", None):
+            run_dir = Path(args.run_dir).resolve()
+        else:
+            timestamp_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+            run_dir = Path(data_dir) / "outputs" / f"run_{timestamp_str}"
         run_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Reconstruct run directory: {run_dir}")
 
@@ -442,6 +592,10 @@ def _handle_reconstruct_command(args: argparse.Namespace) -> int:
         kf_cfg = cfg.keyframes
         if getattr(args, "stride", None) is not None:
             kf_cfg.stride = args.stride
+        elif is_video:
+            # Parallax-aware sampling: UAV forward-flight needs sufficient baseline-to-depth
+            # ratio (B/D >= 0.05) to avoid collinear gauge degeneracy and pitch drift.
+            kf_cfg.stride = 2 if budget > 50 else 1
         kf_cfg.max_frames = min(kf_cfg.max_frames, budget)
 
         selector = KeyframeSelector(config=kf_cfg)
@@ -512,6 +666,8 @@ def _handle_reconstruct_command(args: argparse.Namespace) -> int:
             num_keyframes=kf_summary.selected_count,
             num_models=result.num_models,
             mean_reprojection_error_px=result.mean_reprojection_error_px,
+            intrinsics_note=result.intrinsics_note,
+            focal_search=result.intrinsics_info,
         )
 
         # 5. Telemetry sync (only when the source carries telemetry records)
@@ -580,6 +736,18 @@ def _handle_reconstruct_command(args: argparse.Namespace) -> int:
         table.add_row("Frames Registered", f"[{reg_style}]{result.num_reg_images}/{kf_summary.selected_count}[/] ({result.registration_rate*100:.1f}%)")
         table.add_row("Mean Reprojection Error", f"[{reproj_style}]{result.mean_reprojection_error_px:.3f} px[/]")
         table.add_row("3D Points", f"{model_result.num_points:,}")
+        if result.intrinsics_info is not None:
+            info = result.intrinsics_info
+            method = {
+                "vanishing_points": "from vanishing points, fixed",
+                "trial_search": (
+                    "trial search, refined" if info.get("focal_observable") else "trial search, fixed (unobservable)"
+                ),
+            }.get(info.get("method", ""), str(info.get("method")))
+            table.add_row(
+                "Focal Length",
+                f"{info['selected_focal_px']:.0f} px ({method}; generic prior {info['prior_focal_px']:.0f})",
+            )
         table.add_row("SfM Wall Time", f"{result.total_wall_time_s:.1f} s (peak {result.peak_rss_mb:.0f} MB)")
         table.add_row("Telemetry Sync", "done (telemetry.json)" if telemetry_wrote else "skipped (no telemetry for video-only run)")
         table.add_row("ATE Validation", "done (ate_report.json)" if ate_wrote else "skipped (no ground truth)")
@@ -687,6 +855,10 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
         poses_enriched_path.write_text(poses_enriched.model_dump_json(indent=2), encoding="utf-8")
         logger.info(f"Wrote enriched poses to {poses_enriched_path}")
 
+        from uav3d.visualization import generate_telemetry_sync_plot
+
+        tel_plot_name = generate_telemetry_sync_plot(telemetry_path, poses_enriched_path, run_dir)
+
         # 6. Display Summary Table
         table = Table(
             title=f"Telemetry Synchronization Summary: [bold cyan]{run_dir.name}[/bold cyan]",
@@ -712,6 +884,8 @@ def _handle_sync_command(args: argparse.Namespace) -> int:
         table.add_row("Distance Consistency Note", str(tel_file.distance_consistency_note))
         table.add_row("Telemetry JSON", str(telemetry_path))
         table.add_row("Enriched Poses JSON", str(poses_enriched_path))
+        if tel_plot_name:
+            table.add_row("Sync Alignment Plot", str(run_dir / tel_plot_name))
 
         console.print(table)
     return 0
@@ -745,24 +919,11 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
             raise Uav3dError(f"poses.json does not exist in {run_dir}. Run 'uav3d sfm' first.")
 
         # 2. Resolve ground truth file
-        gt_file = None
-        if getattr(args, "gt_file", None):
-            gt_file = Path(args.gt_file).resolve()
-        else:
-            candidates = [
-                Path(data_dir) / "raw" / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
-                Path(data_dir) / "zurich_mav" / "Log Files" / "GroundTruthAGL.csv",
-                Path(data_dir) / "Log Files" / "GroundTruthAGL.csv",
-            ]
-            for c in candidates:
-                if c.exists():
-                    gt_file = c
-                    break
-
+        gt_file = _find_ground_truth(data_dir, args, cfg)
         if gt_file is None or not gt_file.exists():
             raise Uav3dError(
                 f"Ground truth file GroundTruthAGL.csv not found in standard paths under {data_dir}. "
-                "Please specify path with --gt-file."
+                "Please specify path with --gt-file or --dataset-dir."
             )
 
         logger.info(f"Using ground truth file: {gt_file}")
@@ -831,6 +992,7 @@ def _handle_view_command(args: argparse.Namespace) -> int:
     import socketserver
     import threading
     import webbrowser
+
     from uav3d.modeling.dashboard import generate_viewer_html
 
     run_dir = Path(args.run_dir).resolve() if getattr(args, "run_dir", None) else None
@@ -929,6 +1091,20 @@ def create_parser() -> argparse.ArgumentParser:
         help="Inspect raw video/sequence metadata, calibration, and timestamps",
     )
     _add_common_arguments(inspect_parser)
+    inspect_parser.add_argument(
+        "--out",
+        "--run-dir",
+        "--output-dir",
+        dest="run_dir",
+        type=str,
+        default=None,
+        help="Directory to save inspection artifacts",
+    )
+    inspect_parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Explicitly save inspection artifacts (JSON, text summary, and plot)",
+    )
 
     # 2. keyframes
     keyframes_parser = subparsers.add_parser(
@@ -936,6 +1112,15 @@ def create_parser() -> argparse.ArgumentParser:
         help="Extract and select sharp keyframes from ingested video/images",
     )
     _add_common_arguments(keyframes_parser)
+    keyframes_parser.add_argument(
+        "--out",
+        "--run-dir",
+        "--output-dir",
+        dest="run_dir",
+        type=str,
+        default=None,
+        help="Explicit run directory to save keyframes and images (defaults to new run_<timestamp>)",
+    )
     keyframes_parser.add_argument(
         "--max-frames",
         type=int,
@@ -950,7 +1135,9 @@ def create_parser() -> argparse.ArgumentParser:
     )
     _add_common_arguments(sfm_parser)
     sfm_parser.add_argument(
+        "--out",
         "--run-dir",
+        dest="run_dir",
         type=str,
         default=None,
         help="Explicit run directory containing sfm/images and keyframes.json (defaults to latest run)",
@@ -961,6 +1148,11 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override sequential matching overlap window",
     )
+    sfm_parser.add_argument(
+        "--dense",
+        action="store_true",
+        help="Run post-SfM dense neural depth & mesh generation (SP-2 preview; default off for fast SP-1 demo)",
+    )
 
     # 4. sync
     sync_parser = subparsers.add_parser(
@@ -969,7 +1161,9 @@ def create_parser() -> argparse.ArgumentParser:
     )
     _add_common_arguments(sync_parser)
     sync_parser.add_argument(
+        "--out",
         "--run-dir",
+        dest="run_dir",
         type=str,
         default=None,
         help="Explicit run directory containing poses.json and keyframes.json (defaults to latest run)",
@@ -989,7 +1183,9 @@ def create_parser() -> argparse.ArgumentParser:
     )
     _add_common_arguments(validate_parser)
     validate_parser.add_argument(
+        "--out",
         "--run-dir",
+        dest="run_dir",
         type=str,
         default=None,
         help="Explicit run directory containing poses.json (defaults to latest run)",
@@ -1007,6 +1203,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Single-pass end-to-end: video -> keyframes -> SfM -> 3D model (point cloud + trajectory)",
     )
     _add_common_arguments(reconstruct_parser)
+    reconstruct_parser.add_argument(
+        "--out",
+        "--run-dir",
+        dest="run_dir",
+        type=str,
+        default=None,
+        help="Explicit output directory for reconstruction results",
+    )
     reconstruct_parser.add_argument(
         "--max-frames",
         type=int,
@@ -1048,10 +1252,27 @@ def create_parser() -> argparse.ArgumentParser:
         help="Optional ground truth CSV; enables ATE validation (otherwise skipped)",
     )
     reconstruct_parser.add_argument(
+        "--focal-px",
+        type=float,
+        default=None,
+        help=(
+            "Known focal length in pixels of the (possibly cropped/resized) video frame. Skips the automatic "
+            "focal search and keeps the focal fixed. Recommended for forward-flight video, where the focal "
+            "length cannot be recovered from the images"
+        ),
+    )
+    reconstruct_parser.add_argument(
         "--label",
         type=str,
         default=None,
         help="Dataset provenance label recorded in all outputs",
+    )
+    reconstruct_parser.add_argument(
+        "--no-dense",
+        action="store_false",
+        dest="dense",
+        default=True,
+        help="Skip neural depth/TSDF fusion and export sparse SfM only",
     )
 
     # 7. view (interactive 3D WebGL / GIS Dashboard)
@@ -1081,11 +1302,49 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+FLAG_ALIASES: dict[str, str] = {
+    "--inspect": "inspect",
+    "--ingestion": "inspect",
+    "--keyframes": "keyframes",
+    "--keyframe-extraction": "keyframes",
+    "--keyframe_extraction": "keyframes",
+    "--sfm": "sfm",
+    "--sync": "sync",
+    "--telemetry-sync": "sync",
+    "--telemetry_sync": "sync",
+    "--validate": "validate",
+    "--trajectory-eval": "validate",
+    "--trajectory_eval": "validate",
+    "--ate-eval": "validate",
+    "--ate_eval": "validate",
+    "--reconstruct": "reconstruct",
+    "--view": "view",
+}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Main CLI entrypoint with robust error handling."""
+    """Main CLI entrypoint with robust error handling and flag aliasing."""
+    if argv is None:
+        raw_args = list(sys.argv[1:])
+    else:
+        raw_args = list(argv)
+
+    # Check for flag alias (e.g. uav3d --keyframe-extraction => uav3d keyframes)
+    matched_cmd = None
+    cleaned_args: list[str] = []
+    for arg in raw_args:
+        lower_arg = arg.lower()
+        if lower_arg in FLAG_ALIASES and matched_cmd is None:
+            matched_cmd = FLAG_ALIASES[lower_arg]
+        else:
+            cleaned_args.append(arg)
+
+    if matched_cmd and (not cleaned_args or cleaned_args[0] not in SUBCOMMANDS):
+        cleaned_args.insert(0, matched_cmd)
+
     parser = create_parser()
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(cleaned_args)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 0
 

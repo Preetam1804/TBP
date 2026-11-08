@@ -28,6 +28,12 @@ class ReconstructionSummary(BaseModel):
         default="monocular SfM: metric scale is unknown until aligned to a metric reference (GPS/GT)",
         description="Scale interpretation of the exported model",
     )
+    intrinsics_note: str | None = Field(
+        default=None, description="How the camera focal length was chosen and how far it can be trusted"
+    )
+    focal_search: dict | None = Field(
+        default=None, description="Focal-search evidence (candidates, selected focal, observability) if it ran"
+    )
     model_ply: str = Field(default="model.ply", description="Path (relative to run dir) of the colored point cloud")
     cloud_dense_ply: str | None = Field(default=None, description="Path (relative to run dir) of dense point cloud")
     mesh_ply: str | None = Field(default=None, description="Path (relative to run dir) of surface triangle mesh")

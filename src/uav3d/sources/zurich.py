@@ -100,6 +100,10 @@ class ZurichSequenceSource(ImageSource):
 
         # Find Log directory or CSVs
         gps_candidates = [
+            self.dataset_dir / "Log Files" / "OnboardGPS.csv",
+            self.dataset_dir / "Log_Files" / "OnboardGPS.csv",
+            self.dataset_dir / "logs" / "OnboardGPS.csv",
+            self.dataset_dir / "OnboardGPS.csv",
             self.dataset_dir / "Log Files" / "OnbordGPS.csv",
             self.dataset_dir / "Log_Files" / "OnbordGPS.csv",
             self.dataset_dir / "logs" / "OnbordGPS.csv",
@@ -237,15 +241,17 @@ class ZurichSequenceSource(ImageSource):
         if self.calib_file and self.calib_file.exists():
             try:
                 npz = np.load(self.calib_file)
-                # Standard keys in calibration npz files
-                if "camera_matrix" in npz:
-                    K = npz["camera_matrix"]
+                # Standard keys in calibration npz files (handles both RPG Zurich official and custom formats)
+                k_key = "intrinsic_matrix" if "intrinsic_matrix" in npz else ("camera_matrix" if "camera_matrix" in npz else None)
+                if k_key is not None:
+                    K = npz[k_key]
                     fx, fy = float(K[0, 0]), float(K[1, 1])
                     cx, cy = float(K[0, 2]), float(K[1, 2])
                     params = [fx, fy, cx, cy]
                     model = "PINHOLE"
-                    if "distortion_coefficients" in npz:
-                        d = npz["distortion_coefficients"].flatten()
+                    dist_key = "distCoeff" if "distCoeff" in npz else ("distortion_coefficients" if "distortion_coefficients" in npz else None)
+                    if dist_key is not None:
+                        d = npz[dist_key].flatten()
                         params.extend([float(v) for v in d[:4]])
                         model = "OPENCV"
                     return CameraCalibration(

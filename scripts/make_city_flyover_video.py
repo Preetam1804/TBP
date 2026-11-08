@@ -432,6 +432,7 @@ def render_frame(
     texture_bgr: np.ndarray,
     buildings: list[Building],
     straight: bool = False,
+    caption: bool = True,
 ) -> np.ndarray:
     """Render one frame (BGR image). `texture_bgr` is the ground texture in BGR order."""
     R, C = camera_pose(index, total, straight=straight)
@@ -469,16 +470,17 @@ def render_frame(
     for _, px, col in draw_list:
         cv2.fillPoly(img, [px], (int(col[2]), int(col[1]), int(col[0])), lineType=cv2.LINE_AA)
 
-    cv2.putText(
-        img,
-        f"CITY FLYOVER {index:05d}",
-        (10, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
+    if caption:
+        cv2.putText(
+            img,
+            f"CITY FLYOVER {index:05d}",
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
     return img
 
 
@@ -567,6 +569,7 @@ def make_city_flyover_video(
     fps: float = 30.0,
     focal_ratio: float = 0.9,
     straight: bool = False,
+    caption: bool = True,
 ) -> Path:
     """Write the video plus all ground-truth artifacts; return the video path.
 
@@ -588,7 +591,7 @@ def make_city_flyover_video(
         raise RuntimeError(f"Could not open video writer for {out}")
 
     for i in range(frames):
-        writer.write(render_frame(i, frames, width, height, focal, texture_bgr, buildings, straight=straight))
+        writer.write(render_frame(i, frames, width, height, focal, texture_bgr, buildings, straight=straight, caption=caption))
         if (i + 1) % 60 == 0 or i + 1 == frames:
             print(f"  rendered {i + 1}/{frames} frames", flush=True)
     writer.release()
@@ -645,8 +648,18 @@ def main() -> None:
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--focal-ratio", type=float, default=0.9, help="Focal length as a multiple of width")
     parser.add_argument("--straight", action="store_true", help="Dead-straight collinear flight path (no weave/yaw oscillation)")
+    parser.add_argument("--no-caption", action="store_true", help="Disable burned-in frame index caption text")
     args = parser.parse_args()
-    path = make_city_flyover_video(args.out, args.frames, args.width, args.height, args.fps, args.focal_ratio, straight=args.straight)
+    path = make_city_flyover_video(
+        args.out,
+        args.frames,
+        args.width,
+        args.height,
+        args.fps,
+        args.focal_ratio,
+        straight=args.straight,
+        caption=not args.no_caption,
+    )
     print(
         f"Wrote city flyover video: {path} "
         f"({args.frames} frames, {args.width}x{args.height} @ {args.fps} fps, seed={SEED}, straight={args.straight})\n"

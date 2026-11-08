@@ -43,8 +43,8 @@ class SfmConfig(BaseModel):
 
     camera_model: str = Field(default="OPENCV", description="COLMAP camera model")
     single_camera: bool = Field(default=True, description="Share a single camera intrinsic model across all frames")
-    seq_overlap: int = Field(default=10, ge=1, description="Sequential matching overlap window")
-    max_image_size: int = Field(default=1600, gt=0, description="Maximum image dimension for feature extraction")
+    seq_overlap: int = Field(default=20, ge=1, description="Sequential matching overlap window")
+    max_image_size: int = Field(default=2400, gt=0, description="Maximum image dimension for feature extraction")
     refine_intrinsics: bool = Field(default=False, description="Whether to refine camera intrinsics during bundle adjustment")
     feature_type: str = Field(default="SIFT", description="Feature extractor type")
     matcher_type: str = Field(default="sequential", description="COLMAP matcher type (sequential, exhaustive, or vocabtree)")
@@ -57,9 +57,9 @@ class SfmConfig(BaseModel):
         ),
     )
     exhaustive_max_images: int = Field(
-        default=120,
+        default=180,
         ge=2,
-        description="Max keyframes for exhaustive matching (n*(n-1)/2 pairs; 120 images = 7140 pairs).",
+        description="Max keyframes for exhaustive matching (n*(n-1)/2 pairs; 180 images = 16110 pairs).",
     )
     loop_detection: bool = Field(
         default=False,
@@ -67,7 +67,7 @@ class SfmConfig(BaseModel):
     )
     loop_detection_period: int = Field(default=10, ge=1, description="Insert loop-closure candidates every N images.")
     vocab_tree_path: str | None = Field(default=None, description="Optional vocab-tree file for loop/vocabtree matching.")
-    min_num_matches: int = Field(default=15, ge=1, description="Minimum inlier matches for pair")
+    min_num_matches: int = Field(default=15, ge=1, description="Minimum geometric inlier matches for a verified pair")
     init_min_inliers: int = Field(default=15, ge=1, description="Minimum inliers for initial pair")
     init_min_tri_angle: float = Field(default=2.0, ge=0.0, description="Minimum triangulation angle for initial pair in degrees")
     abs_pose_min_inliers: int = Field(default=10, ge=1, description="Minimum inliers for absolute pose registration")
@@ -86,6 +86,52 @@ class SfmConfig(BaseModel):
         gt=0,
         le=10000,
         description="Maximum initialization pair trials per reconstruction attempt (COLMAP default 200).",
+    )
+    focal_search: bool = Field(
+        default=False,
+        description=(
+            "Pick the focal prior by trial reconstruction and test whether the focal is observable. "
+            "Enabled automatically for video runs with auto-estimated intrinsics (see sfm/focal_search.py)."
+        ),
+    )
+    vp_focal: bool = Field(
+        default=False,
+        description=(
+            "Estimate the focal length from vanishing points of orthogonal scene lines (sfm/vp_focal.py). "
+            "A reliable estimate is used as a fixed focal and replaces the trial search. Enabled by the CLI "
+            "for video runs with auto-estimated intrinsics."
+        ),
+    )
+    vp_max_frames: int = Field(default=12, ge=2, description="Keyframes sampled for vanishing-point detection.")
+    vp_min_frames: int = Field(default=4, ge=1, description="Frames that must agree for a VP focal to be accepted.")
+    vp_max_spread: float = Field(
+        default=0.08, gt=0.0, description="Max relative scatter (std of log focal) of the winning VP mode."
+    )
+    focal_search_min_gain: float = Field(
+        default=0.25,
+        ge=0.0,
+        description=(
+            "A focal other than the prior is only chosen when its trial reprojection error is at least this "
+            "fraction lower than the prior's (trials on few frames are noisy)."
+        ),
+    )
+    focal_search_factors: list[float] = Field(
+        default_factory=lambda: [1.0, 0.75, 0.55, 0.4, 0.3],
+        description="Focal candidates tried, as multiples of the prior focal (in order).",
+    )
+    focal_search_max_images: int = Field(
+        default=14, ge=4, description="Evenly spaced keyframes used for each focal trial reconstruction."
+    )
+    focal_search_tolerance: float = Field(
+        default=0.05, ge=0.0, description="Relative reprojection-error difference treated as a tie."
+    )
+    focal_observability_threshold: float = Field(
+        default=0.02,
+        ge=0.0,
+        description=(
+            "Minimum relative reprojection-error increase when the focal is changed by x0.8 / x1.25 "
+            "for the focal to count as observable (and therefore refined)."
+        ),
     )
 
 

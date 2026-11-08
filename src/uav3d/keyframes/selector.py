@@ -95,6 +95,51 @@ class KeyframeSelector:
 
         return p.resolve()
 
+    def _cap_with_temporal_coverage(
+        self,
+        records: list[KeyframeRecord],
+        indices: list[int],
+        max_frames: int,
+    ) -> tuple[list[KeyframeRecord], list[int]]:
+        """Select a quality-ranked temporal cover instead of truncating the flight.
+
+        A video reconstruction is only as complete as the portion of the flight
+        represented in SfM.  Taking ``records[:max_frames]`` silently discards
+        the end of every over-budget flight, which produces a locally good but
+        globally incomplete model.  Divide the candidate timeline into bins and
+        keep the sharpest, most textured frame in each bin.  The final list is
+        restored to chronological order so sequential matchers still see the
+        original flight path.
+        """
+        if len(records) <= max_frames:
+            return records, indices
+        if max_frames <= 0:
+            return [], []
+
+        chosen: list[int] = []
+        for bin_id in range(max_frames):
+            # Search locally around the target bin center.  Blur is the primary
+            # quality signal; feature count breaks ties in low-texture footage.
+            left = (bin_id * len(records)) // max_frames
+            right = ((bin_id + 1) * len(records)) // max_frames
+            left = max(0, min(left, len(records) - 1))
+            right = max(left + 1, min(right, len(records)))
+            candidates = range(left, right)
+            best = max(
+                candidates,
+                key=lambda i: (
+                    float(records[i].metrics.get("blur_score", records[i].score))
+                    if records[i].metrics
+                    else float(records[i].score),
+                    float(records[i].metrics.get("feature_count", 0.0)) if records[i].metrics else 0.0,
+                ),
+            )
+            if best not in chosen:
+                chosen.append(best)
+
+        chosen.sort()
+        return [records[i] for i in chosen], [indices[i] for i in chosen]
+
     def select(
         self,
         source: ImageSource,
@@ -263,8 +308,9 @@ class KeyframeSelector:
         # 4. Cap at max_frames
         if len(selected_records) > self.max_frames:
             logger.info(f"Capping selected keyframes from {len(selected_records)} to max_frames={self.max_frames}")
-            selected_records = selected_records[: self.max_frames]
-            selected_indices = selected_indices[: self.max_frames]
+            selected_records, selected_indices = self._cap_with_temporal_coverage(
+                selected_records, selected_indices, self.max_frames
+            )
 
         logger.info(
             f"Selection completed: {len(selected_records)}/{total_frames} frames selected "

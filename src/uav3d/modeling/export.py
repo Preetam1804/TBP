@@ -38,6 +38,9 @@ def export_model(
     num_models: int,
     mean_reprojection_error_px: float | None,
     scale_note: str = "monocular SfM: metric scale is unknown until aligned to a metric reference (GPS/GT)",
+    dense: bool = True,
+    intrinsics_note: str | None = None,
+    focal_search: dict | None = None,
 ) -> ModelExportResult:
     """Export the reconstruction as viewer-ready 3D model artifacts.
 
@@ -65,6 +68,8 @@ def export_model(
         num_models: Number of reconstructions produced.
         mean_reprojection_error_px: Mean reprojection error of the main model.
         scale_note: Scale interpretation text for the summary.
+        intrinsics_note: Optional note on how the focal length was chosen.
+        focal_search: Optional focal-search evidence recorded in the summary.
     """
     run_path = Path(run_dir).resolve()
     run_path.mkdir(parents=True, exist_ok=True)
@@ -94,7 +99,9 @@ def export_model(
     logger.info(f"Exported camera trajectory to {trajectory_ply}")
 
     # --- 4. Dense colored point cloud and surface mesh ---
-    mesh_ply, mesh_decimated_ply, cloud_dense_ply = _generate_dense_model_and_mesh(run_path)
+    mesh_ply, mesh_decimated_ply, cloud_dense_ply = None, None, None
+    if dense:
+        mesh_ply, mesh_decimated_ply, cloud_dense_ply = _generate_dense_model_and_mesh(run_path)
 
     # --- 5. Full 3D Map Completion (Volumetric structures + continuous terrain + Orthomosaic + DSM) ---
     map_3d_ply, map_3d_glb, orthomosaic_png, dsm_png = None, None, None, None
@@ -137,6 +144,8 @@ def export_model(
             else None
         ),
         scale_note=scale_note,
+        intrinsics_note=intrinsics_note,
+        focal_search=focal_search,
         model_ply="model.ply",
         cloud_dense_ply="cloud_dense.ply" if cloud_dense_ply and cloud_dense_ply.exists() else None,
         mesh_ply="mesh.ply" if mesh_ply and mesh_ply.exists() else None,

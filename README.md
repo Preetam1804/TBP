@@ -21,9 +21,11 @@ It creates a single run directory (`data/outputs/run_<timestamp>/`, or `--data-d
 | `reconstruction_summary.json` | Versioned manifest: registration stats, artifact paths, scale caveat |
 | `colmap_native.log` | Raw COLMAP C++ log (captured off the console) |
 
-Stages: keyframe selection (quality-scored; `--max-frames` is a hard budget on
+Stages: keyframe selection (quality-scored and temporally distributed; `--max-frames` is a hard budget on
 evaluated *and* selected frames) → COLMAP incremental SfM (pycolmap, automatic
 PINHOLE intrinsics unless `--calibration-file` is given) → 3D model export.
+The `reconstruct` command runs dense Depth-Anything-v2/TSDF fusion by default;
+use `--no-dense` only when a sparse SfM result is explicitly desired.
 Telemetry sync and ATE validation are skipped with an INFO note on video-only
 runs; the summary records `null` for them.
 

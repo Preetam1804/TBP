@@ -191,7 +191,59 @@ def compute_ate(
     matched_count = len(matched_frame_ids)
     logger.info(f"Common frames between SfM and Ground Truth: {matched_count}/{len(poses_file.poses)}")
 
-    # 3. Guard against too few matches
+    # 3. If ground truth is subsampled at intervals (e.g. Zurich 1 fps / 30-frame gaps),
+    # interpolate along the flight path for intermediate keyframes between GT anchors.
+    if matched_count < 10 and len(parsed_gt) >= 2:
+        sorted_gt_ids = sorted(parsed_gt.keys())
+        gt_min, gt_max = sorted_gt_ids[0], sorted_gt_ids[-1]
+        max_gap = max(b - a for a, b in zip(sorted_gt_ids[:-1], sorted_gt_ids[1:])) if len(sorted_gt_ids) > 1 else 1
+
+        if max_gap > 2:
+            logger.info(
+                f"Ground truth has {max_gap}-frame sampling intervals (e.g. 1 fps photogrammetry). "
+                f"Interpolating ground truth along flight path for keyframes in range [{gt_min}, {gt_max}]."
+            )
+            import bisect
+
+            matched_frame_ids = []
+            est_points_list = []
+            gt_points_list = []
+
+            for pose in poses_file.poses:
+                if not pose.registered or pose.camera_center_world is None:
+                    continue
+                fid = pose.frame_id
+                match = num_pattern.search(fid)
+                if not match:
+                    continue
+                num_id = int(match.group(1))
+
+                if num_id in parsed_gt:
+                    gt_entry = parsed_gt[num_id]
+                    matched_frame_ids.append(fid)
+                    est_points_list.append(list(pose.camera_center_world))
+                    gt_points_list.append([float(gt_entry.x), float(gt_entry.y), float(gt_entry.z)])
+                elif gt_min <= num_id <= gt_max:
+                    idx = bisect.bisect_right(sorted_gt_ids, num_id)
+                    if 0 < idx < len(sorted_gt_ids):
+                        id_prev = sorted_gt_ids[idx - 1]
+                        id_next = sorted_gt_ids[idx]
+                        gt_prev = parsed_gt[id_prev]
+                        gt_next = parsed_gt[id_next]
+                        alpha = (num_id - id_prev) / (id_next - id_prev)
+                        interp_x = float(gt_prev.x) + alpha * float(gt_next.x - gt_prev.x)
+                        interp_y = float(gt_prev.y) + alpha * float(gt_next.y - gt_prev.y)
+                        interp_z = float(gt_prev.z) + alpha * float(gt_next.z - gt_prev.z)
+                        matched_frame_ids.append(fid)
+                        est_points_list.append(list(pose.camera_center_world))
+                        gt_points_list.append([interp_x, interp_y, interp_z])
+
+            matched_count = len(matched_frame_ids)
+            logger.info(
+                f"After flight-path interpolation, common frames between SfM and Ground Truth: {matched_count}/{len(poses_file.poses)}"
+            )
+
+    # 4. Guard against too few matches
     if matched_count < 10:
         raise Uav3dError(
             f"ATE Validation FAILED: Fewer than 10 common frames matched between SfM "
