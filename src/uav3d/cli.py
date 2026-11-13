@@ -14,9 +14,10 @@ from rich.table import Table
 from uav3d import __version__
 from uav3d.config import PipelineConfig, load_config
 from uav3d.dense.config import DenseConfig
-from uav3d.exceptions import Uav3dError
+from uav3d.exceptions import DataError, Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
+from uav3d.models.calibration_io import read_calibration, write_calibration
 from uav3d.models.frames import CameraCalibration
 from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
@@ -96,8 +97,8 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
 
     with timed_stage("inspect", logger=logger):
-        source_type = cfg.source.type.lower()
         source = _build_source(cfg, data_dir, args)
+        source_type = "video" if isinstance(source, VideoFileSource) else cfg.source.type.lower()
         meta = source.metadata()
         calib = source.calibration()
 
@@ -169,6 +170,24 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         selector = KeyframeSelector(config=cfg.keyframes)
         summary = selector.select(source=source, output_dir=run_dir, dataset_label=cfg.dataset_label)
 
+        # A zero-keyframe run would otherwise "succeed" and fail several stages
+        # later with an opaque message. Every frame in the whole video being
+        # rejected by the quality gate is almost always a threshold mismatch with
+        # the footage (bright sky, soft focus), so name it here.
+        if summary.considered_count > 0 and summary.selected_count == 0:
+            raise DataError(
+                f"No keyframes passed the quality gate: all {summary.considered_count} frames "
+                f"were rejected (blur median {summary.blur_dist.median_val:.1f} vs "
+                f"min_blur={cfg.keyframes.min_blur}, clipping median "
+                f"{summary.clipping_dist.median_val * 100:.1f}% vs "
+                f"max_clipping={cfg.keyframes.max_clipping * 100:.0f}%). "
+                "Relax 'keyframes.min_blur' or raise 'keyframes.max_clipping' for this footage."
+            )
+
+        # Persist the source intrinsics so later stages never need the video file.
+        # Written only after the run is known to be usable.
+        write_calibration(source.calibration(), run_dir)
+
         table = Table(title=f"Keyframe Extraction Summary: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
         table.add_column("Metric / Property", style="bold white", width=28)
         table.add_column("Value", style="green")
@@ -196,6 +215,43 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
 
         console.print(table)
     return 0
+
+
+# Intrinsics layout per COLMAP camera model: (focal terms, principal point terms)
+_CAMERA_LAYOUT: dict[str, tuple[int, int]] = {
+    "SIMPLE_PINHOLE": (1, 2),
+    "PINHOLE": (2, 2),
+    "SIMPLE_RADIAL": (1, 2),
+    "RADIAL": (1, 2),
+    "OPENCV": (2, 2),
+    "FULL_OPENCV": (2, 2),
+}
+
+
+def _scale_calibration_params(model: str, params: list[float], sx: float, sy: float) -> list[float]:
+    """Rescale intrinsics for an image resized by ``(sx, sy)``.
+
+    Focal terms scale with the axis they belong to; the principal point with its
+    own axis; any extra distortion coefficients are dimensionless and untouched.
+    """
+    layout = _CAMERA_LAYOUT.get(model.upper())
+    if layout is None:
+        raise Uav3dError(
+            f"Cannot rescale intrinsics for unsupported camera model '{model}'. "
+            f"Supported: {', '.join(sorted(_CAMERA_LAYOUT))}."
+        )
+    focal_terms, _principal_point_terms = layout
+    scaled = [float(v) for v in params]
+    if focal_terms == 1:
+        scaled[0] *= 0.5 * (sx + sy)
+        cx_index, cy_index = 1, 2
+    else:
+        scaled[0] *= sx
+        scaled[1] *= sy
+        cx_index, cy_index = 2, 3
+    scaled[cx_index] *= sx
+    scaled[cy_index] *= sy
+    return scaled
 
 
 def _handle_sfm_command(args: argparse.Namespace) -> int:
@@ -246,35 +302,78 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
                 if sample_mat is not None:
                     actual_height, actual_width = sample_mat.shape[:2]
 
+        # A run is a "video run" if its keyframes came from a video, which is
+        # knowable from the stored calibration as well as from the config.
+        stored = read_calibration(run_dir)
         is_video_run = (
             any(name.startswith("video_") for name in all_image_names)
             or getattr(args, "video", None) is not None
             or cfg.source.type.lower() == "video"
+            or (stored is not None and str(stored.source).startswith("video"))
         )
 
-        if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
-            w = actual_width or 1920
-            h = actual_height or 1080
-            fx = fy = float(w) * 0.9
-            cx = float(w) / 2.0
-            cy = float(h) / 2.0
-            calibration = CameraCalibration(
-                model="PINHOLE",
-                width=w,
-                height=h,
-                params=[fx, fy, cx, cy],
-                source=f"auto_video_{w}x{h}",
-            )
-            cfg.sfm.camera_model = "PINHOLE"
-            cfg.sfm.refine_intrinsics = True
+        # Prefer the calibration saved by the keyframes stage: it is the one that
+        # actually described the frames in this run, and it means SfM can run on
+        # an archived run directory without the original video being present.
+        calibration = stored
+        if calibration is not None:
             logger.info(
-                f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
-                f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
+                "Using calibration from %s: %s %s",
+                run_dir.name,
+                calibration.model,
+                calibration.params,
             )
         else:
+            # The keyframe images on disk are the authority on resolution; a stale
+            # config resolution would silently rescale every principal point.
             source = _build_source(cfg, data_dir, args)
             calibration = source.calibration()
-            logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+        if actual_width and actual_height and (
+            int(calibration.width), int(calibration.height)
+        ) != (actual_width, actual_height):
+            logger.info(
+                f"Rescaling calibration from {calibration.width}x{calibration.height} "
+                f"to on-disk {actual_width}x{actual_height}"
+            )
+            sx = actual_width / float(calibration.width)
+            sy = actual_height / float(calibration.height)
+            calibration = CameraCalibration(
+                model=calibration.model,
+                width=actual_width,
+                height=actual_height,
+                params=_scale_calibration_params(calibration.model, calibration.params, sx, sy),
+                source=calibration.source,
+            )
+        logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+
+        if is_video_run:
+            # Forward flight has a fundamental focal-length/depth ambiguity: image
+            # velocity is f * d_inv, so focal length and scene depth trade off
+            # almost freely along the flight axis. With PINHOLE, fx and fy are
+            # refined independently and were observed to diverge to a physically
+            # impossible fx/fy = 1.57, which warps every depth the dense stage then
+            # produces. SIMPLE_PINHOLE ties both axes to one focal, which is
+            # correct for square sensor pixels and removes that failure mode.
+            focal_terms, _ = _CAMERA_LAYOUT.get(calibration.model.upper(), (1, 2))
+            principal_point = (
+                [float(v) for v in calibration.params[1:3]]
+                if focal_terms == 1
+                else [float(v) for v in calibration.params[2:4]]
+            )
+            one_focal = float(calibration.params[0])
+            cfg.sfm.camera_model = "SIMPLE_PINHOLE"
+            calibration = CameraCalibration(
+                model="SIMPLE_PINHOLE",
+                width=calibration.width,
+                height=calibration.height,
+                params=[one_focal, *principal_point],
+                source=calibration.source,
+            )
+            logger.info(
+                "Video run: SIMPLE_PINHOLE f=%.1f px (focal refinement %s)",
+                one_focal,
+                "enabled" if cfg.sfm.refine_intrinsics else "disabled",
+            )
 
         # 4. Optional CLI overrides
         if getattr(args, "overlap", None) is not None:

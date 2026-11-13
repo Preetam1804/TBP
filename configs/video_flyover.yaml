@@ -1,0 +1,61 @@
+# Configuration for a single monocular video file (e.g. city_flyover).
+#
+# Use with:  python -m uav3d.cli keyframes --video /path/to/city_flyover.mp4 \
+#                --config configs/video_flyover.yaml
+# The --video flag takes precedence over source.video_path, so the file path can
+# live on the command line and this config stays generic.
+#
+# Differences from zurich_baseline.yaml, and why:
+#   * max_clipping is relaxed from 0.05 to 0.65. Aerial footage with sky in frame
+#     routinely clips 30 %+ of pixels; the 5 % Zurich threshold rejects every
+#     frame and the run dies at the quality gate.
+#   * camera_model is SIMPLE_PINHOLE. Video carries no EXIF intrinsics and the
+#     CLI pins one shared focal for video runs, because refining fx and fy
+#     independently on forward flight produces a physically impossible aspect
+#     ratio (measured 1.69 on synthetic footage).
+#   * refine_intrinsics is true, because the 0.8*width focal guess can be off by
+#     tens of percent on real cameras. With one shared focal the refinement has
+#     only a scale-like degree of freedom to spend, so it is safe to enable.
+#     Check the exported fx/fy afterwards: it must be exactly 1.0.
+#   * min_blur is lowered: video compression softens frames compared with the
+#     Zurich stills.
+
+data_dir: "./data"
+dataset_label: "replayed public dataset (monocular video, unverified scale)"
+
+source:
+  type: "video"
+  # Overridden by --video on the command line.
+  video_path: "data/city_flyover.mp4"
+  count: 300
+  stride: 1
+
+keyframes:
+  strategy: "laplacian_variance"
+  stride: 1
+  max_frames: 250
+  min_blur: 40.0
+  max_clipping: 0.65
+  max_gap: 20
+  orb_features: 2000
+
+sfm:
+  camera_model: "SIMPLE_PINHOLE"
+  single_camera: true
+  seq_overlap: 15
+  max_image_size: 1600
+  refine_intrinsics: true
+  feature_type: "SIFT"
+  matcher_type: "sequential"
+  min_num_matches: 20
+  init_min_inliers: 20
+  init_min_tri_angle: 3.0
+  abs_pose_min_inliers: 12
+
+sync:
+  max_delta_us: 50000
+  strategy: "nearest"
+
+validation:
+  alignment: "sim3"
+  ate_threshold_meters: 5.0
