@@ -13,6 +13,7 @@ from rich.table import Table
 
 from uav3d import __version__
 from uav3d.config import PipelineConfig, load_config
+from uav3d.dense.config import DenseConfig
 from uav3d.exceptions import Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
@@ -33,7 +34,7 @@ from uav3d.validation import (
 console = Console()
 err_console = Console(stderr=True)
 
-SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate")
+SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate", "dense")
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -545,6 +546,88 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_dense_command(args: argparse.Namespace) -> int:
+    """Execute CPU multi-view-stereo dense reconstruction on a completed run."""
+    from uav3d.dense import run_dense
+
+    logger = setup_logging()
+    cfg = load_config(args.config if os.path.exists(args.config) else None)
+    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+
+    with timed_stage("dense", logger=logger):
+        if getattr(args, "run_dir", None):
+            run_dir = Path(args.run_dir).resolve()
+        else:
+            outputs_dir = Path(data_dir) / "outputs"
+            if not outputs_dir.exists():
+                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
+            run_dirs = sorted(
+                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
+                key=lambda p: p.name,
+            )
+            if not run_dirs:
+                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
+            run_dir = run_dirs[-1]
+
+        dense_cfg: DenseConfig = cfg.dense.model_copy(deep=True)
+        if getattr(args, "quick", False):
+            dense_cfg.max_width = 960
+            dense_cfg.ref_stride = 2
+            dense_cfg.max_planes = 64
+            dense_cfg.mesh = True
+        if getattr(args, "max_width", None):
+            dense_cfg.max_width = int(args.max_width)
+        if getattr(args, "ref_stride", None):
+            dense_cfg.ref_stride = int(args.ref_stride)
+        if getattr(args, "num_sources", None):
+            dense_cfg.num_sources = int(args.num_sources)
+        if getattr(args, "depth_range", None):
+            dense_cfg.depth_range = args.depth_range
+        if getattr(args, "scale_source", None):
+            dense_cfg.scale_source = args.scale_source
+        if getattr(args, "scale_factor", None):
+            dense_cfg.scale_factor = float(args.scale_factor)
+        if getattr(args, "no_mesh", False):
+            dense_cfg.mesh = False
+
+        logger.info(f"Dense reconstruction for run: {run_dir}")
+        result = run_dense(
+            run_dir=run_dir,
+            config=dense_cfg,
+            output_dir=args.output_dir,
+            ground_truth_ply=args.gt_ply,
+        )
+
+        table = Table(title=f"CPU Dense Reconstruction: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
+        table.add_column("Metric / Property", style="bold white", width=30)
+        table.add_column("Value", style="green")
+
+        rep = result.report
+        table.add_row("Backend", f"{rep.backend} (multi-view stereo, CPU)")
+        table.add_row("Reference Views", str(rep.geometry.num_reference_views))
+        table.add_row("Working Resolution", f"{rep.geometry.working_width}x{rep.geometry.working_height}")
+        table.add_row("Median Baseline / Depth", f"{rep.geometry.median_baseline_ratio:.3f}")
+        table.add_row("Valid Depth Pixels", f"{rep.depth.valid_fraction * 100:.1f}%")
+        table.add_row("Depth Sigma (units)", f"{rep.fusion.depth_sigma_units:.4f}")
+        table.add_row("Fusion Voxel", f"{rep.fusion.voxel_units:.4f} units"
+                      + (f" ({rep.fusion.voxel_meters:.3f} m)" if rep.fusion.voxel_meters else ""))
+        table.add_row("Fused Points", f"[bold]{rep.fusion.num_points}[/bold]")
+        if rep.mesh is not None:
+            table.add_row("Mesh", f"{rep.mesh.num_vertices} vertices, {rep.mesh.num_faces} triangles")
+        table.add_row("Metric Scale", f"{rep.scale.value:.4f} m/unit ({rep.scale.status})")
+        if rep.evaluation:
+            for key in ("accuracy_median", "precision_at_0.5m", "completeness_at_0.5m", "fscore_at_0.5m"):
+                if key in rep.evaluation:
+                    table.add_row(f"Eval {key}", f"{rep.evaluation[key]:.4f}")
+        table.add_row("Point Cloud", str(result.point_cloud_path))
+        if result.mesh_path is not None:
+            table.add_row("Mesh File", str(result.mesh_path))
+        table.add_row("Report", str(result.report_path))
+        table.add_row("Total Runtime", f"{result.total_seconds:.1f} s")
+        console.print(table)
+    return 0
+
+
 def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
     """Execute stub for unimplemented pipeline stage."""
     logger = setup_logging()
@@ -651,6 +734,78 @@ def create_parser() -> argparse.ArgumentParser:
         help="Path to GroundTruthAGL.csv (defaults to dataset location)",
     )
 
+    # 6. dense
+    dense_parser = subparsers.add_parser(
+        "dense",
+        help="CPU multi-view-stereo dense reconstruction (depth, point cloud, mesh)",
+    )
+    _add_common_arguments(dense_parser)
+    dense_parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Run directory containing poses.json and keyframes.json (defaults to latest)",
+    )
+    dense_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Destination directory (defaults to <run-dir>/dense)",
+    )
+    dense_parser.add_argument(
+        "--max-width",
+        type=int,
+        default=None,
+        help="Working image width (default from config)",
+    )
+    dense_parser.add_argument(
+        "--ref-stride",
+        type=int,
+        default=None,
+        help="Use every Nth frame as a depth reference (2 halves runtime)",
+    )
+    dense_parser.add_argument(
+        "--num-sources",
+        type=int,
+        default=None,
+        help="Source views fused per reference view",
+    )
+    dense_parser.add_argument(
+        "--depth-range",
+        type=str,
+        default=None,
+        help="Manual depth range 'MIN:MAX' in SfM units (overrides sparse-point derivation)",
+    )
+    dense_parser.add_argument(
+        "--scale-source",
+        type=str,
+        choices=["none", "fixed", "gnss"],
+        default=None,
+        help="Metric scale source: none (SfM units), fixed (--scale-factor), or gnss (telemetry)",
+    )
+    dense_parser.add_argument(
+        "--scale-factor",
+        type=float,
+        default=None,
+        help="Metres per SfM unit when --scale-source fixed",
+    )
+    dense_parser.add_argument(
+        "--gt-ply",
+        type=str,
+        default=None,
+        help="Optional ground-truth point cloud (metres) for accuracy/completeness evaluation",
+    )
+    dense_parser.add_argument(
+        "--no-mesh",
+        action="store_true",
+        help="Skip mesh reconstruction (point cloud only)",
+    )
+    dense_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Fast preset: 960 px width, every 2nd reference view, 64 planes",
+    )
+
     return parser
 
 
@@ -673,6 +828,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_sync_command(args)
         if args.command == "validate":
             return _handle_validate_command(args)
+        if args.command == "dense":
+            return _handle_dense_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()
