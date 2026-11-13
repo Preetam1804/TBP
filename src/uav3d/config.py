@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from uav3d.dense.config import DenseConfig
 from uav3d.exceptions import ConfigError
 
 
@@ -102,6 +103,7 @@ class PipelineConfig(BaseModel):
     sfm: SfmConfig = Field(default_factory=SfmConfig)
     sync: SyncConfig = Field(default_factory=SyncConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
+    dense: DenseConfig = Field(default_factory=DenseConfig)
 
 
 def load_config(path: str | Path | None = None) -> PipelineConfig:

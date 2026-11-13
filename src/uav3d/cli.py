@@ -13,9 +13,11 @@ from rich.table import Table
 
 from uav3d import __version__
 from uav3d.config import PipelineConfig, load_config
-from uav3d.exceptions import Uav3dError
+from uav3d.dense.config import DenseConfig
+from uav3d.exceptions import DataError, Uav3dError
 from uav3d.keyframes.selector import KeyframeSelector
 from uav3d.logging_config import setup_logging, timed_stage
+from uav3d.models.calibration_io import read_calibration, write_calibration
 from uav3d.models.frames import CameraCalibration
 from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
@@ -33,7 +35,7 @@ from uav3d.validation import (
 console = Console()
 err_console = Console(stderr=True)
 
-SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate")
+SUBCOMMANDS = ("inspect", "keyframes", "sfm", "sync", "validate", "dense")
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -95,8 +97,8 @@ def _handle_inspect_command(args: argparse.Namespace) -> int:
     data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
 
     with timed_stage("inspect", logger=logger):
-        source_type = cfg.source.type.lower()
         source = _build_source(cfg, data_dir, args)
+        source_type = "video" if isinstance(source, VideoFileSource) else cfg.source.type.lower()
         meta = source.metadata()
         calib = source.calibration()
 
@@ -168,6 +170,24 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         selector = KeyframeSelector(config=cfg.keyframes)
         summary = selector.select(source=source, output_dir=run_dir, dataset_label=cfg.dataset_label)
 
+        # A zero-keyframe run would otherwise "succeed" and fail several stages
+        # later with an opaque message. Every frame in the whole video being
+        # rejected by the quality gate is almost always a threshold mismatch with
+        # the footage (bright sky, soft focus), so name it here.
+        if summary.considered_count > 0 and summary.selected_count == 0:
+            raise DataError(
+                f"No keyframes passed the quality gate: all {summary.considered_count} frames "
+                f"were rejected (blur median {summary.blur_dist.median_val:.1f} vs "
+                f"min_blur={cfg.keyframes.min_blur}, clipping median "
+                f"{summary.clipping_dist.median_val * 100:.1f}% vs "
+                f"max_clipping={cfg.keyframes.max_clipping * 100:.0f}%). "
+                "Relax 'keyframes.min_blur' or raise 'keyframes.max_clipping' for this footage."
+            )
+
+        # Persist the source intrinsics so later stages never need the video file.
+        # Written only after the run is known to be usable.
+        write_calibration(source.calibration(), run_dir)
+
         table = Table(title=f"Keyframe Extraction Summary: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
         table.add_column("Metric / Property", style="bold white", width=28)
         table.add_column("Value", style="green")
@@ -195,6 +215,43 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
 
         console.print(table)
     return 0
+
+
+# Intrinsics layout per COLMAP camera model: (focal terms, principal point terms)
+_CAMERA_LAYOUT: dict[str, tuple[int, int]] = {
+    "SIMPLE_PINHOLE": (1, 2),
+    "PINHOLE": (2, 2),
+    "SIMPLE_RADIAL": (1, 2),
+    "RADIAL": (1, 2),
+    "OPENCV": (2, 2),
+    "FULL_OPENCV": (2, 2),
+}
+
+
+def _scale_calibration_params(model: str, params: list[float], sx: float, sy: float) -> list[float]:
+    """Rescale intrinsics for an image resized by ``(sx, sy)``.
+
+    Focal terms scale with the axis they belong to; the principal point with its
+    own axis; any extra distortion coefficients are dimensionless and untouched.
+    """
+    layout = _CAMERA_LAYOUT.get(model.upper())
+    if layout is None:
+        raise Uav3dError(
+            f"Cannot rescale intrinsics for unsupported camera model '{model}'. "
+            f"Supported: {', '.join(sorted(_CAMERA_LAYOUT))}."
+        )
+    focal_terms, _principal_point_terms = layout
+    scaled = [float(v) for v in params]
+    if focal_terms == 1:
+        scaled[0] *= 0.5 * (sx + sy)
+        cx_index, cy_index = 1, 2
+    else:
+        scaled[0] *= sx
+        scaled[1] *= sy
+        cx_index, cy_index = 2, 3
+    scaled[cx_index] *= sx
+    scaled[cy_index] *= sy
+    return scaled
 
 
 def _handle_sfm_command(args: argparse.Namespace) -> int:
@@ -245,35 +302,78 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
                 if sample_mat is not None:
                     actual_height, actual_width = sample_mat.shape[:2]
 
+        # A run is a "video run" if its keyframes came from a video, which is
+        # knowable from the stored calibration as well as from the config.
+        stored = read_calibration(run_dir)
         is_video_run = (
             any(name.startswith("video_") for name in all_image_names)
             or getattr(args, "video", None) is not None
             or cfg.source.type.lower() == "video"
+            or (stored is not None and str(stored.source).startswith("video"))
         )
 
-        if is_video_run or (actual_width and actual_height and (actual_width, actual_height) != (1920, 1080)):
-            w = actual_width or 1920
-            h = actual_height or 1080
-            fx = fy = float(w) * 0.9
-            cx = float(w) / 2.0
-            cy = float(h) / 2.0
-            calibration = CameraCalibration(
-                model="PINHOLE",
-                width=w,
-                height=h,
-                params=[fx, fy, cx, cy],
-                source=f"auto_video_{w}x{h}",
-            )
-            cfg.sfm.camera_model = "PINHOLE"
-            cfg.sfm.refine_intrinsics = True
+        # Prefer the calibration saved by the keyframes stage: it is the one that
+        # actually described the frames in this run, and it means SfM can run on
+        # an archived run directory without the original video being present.
+        calibration = stored
+        if calibration is not None:
             logger.info(
-                f"Auto-configured PINHOLE calibration for video ({w}x{h}): "
-                f"fx=fy={fx:.1f}, cx={cx:.1f}, cy={cy:.1f} (refine_intrinsics=True)"
+                "Using calibration from %s: %s %s",
+                run_dir.name,
+                calibration.model,
+                calibration.params,
             )
         else:
+            # The keyframe images on disk are the authority on resolution; a stale
+            # config resolution would silently rescale every principal point.
             source = _build_source(cfg, data_dir, args)
             calibration = source.calibration()
-            logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+        if actual_width and actual_height and (
+            int(calibration.width), int(calibration.height)
+        ) != (actual_width, actual_height):
+            logger.info(
+                f"Rescaling calibration from {calibration.width}x{calibration.height} "
+                f"to on-disk {actual_width}x{actual_height}"
+            )
+            sx = actual_width / float(calibration.width)
+            sy = actual_height / float(calibration.height)
+            calibration = CameraCalibration(
+                model=calibration.model,
+                width=actual_width,
+                height=actual_height,
+                params=_scale_calibration_params(calibration.model, calibration.params, sx, sy),
+                source=calibration.source,
+            )
+        logger.info(f"Using camera calibration: {calibration.model} {calibration.params}")
+
+        if is_video_run:
+            # Forward flight has a fundamental focal-length/depth ambiguity: image
+            # velocity is f * d_inv, so focal length and scene depth trade off
+            # almost freely along the flight axis. With PINHOLE, fx and fy are
+            # refined independently and were observed to diverge to a physically
+            # impossible fx/fy = 1.57, which warps every depth the dense stage then
+            # produces. SIMPLE_PINHOLE ties both axes to one focal, which is
+            # correct for square sensor pixels and removes that failure mode.
+            focal_terms, _ = _CAMERA_LAYOUT.get(calibration.model.upper(), (1, 2))
+            principal_point = (
+                [float(v) for v in calibration.params[1:3]]
+                if focal_terms == 1
+                else [float(v) for v in calibration.params[2:4]]
+            )
+            one_focal = float(calibration.params[0])
+            cfg.sfm.camera_model = "SIMPLE_PINHOLE"
+            calibration = CameraCalibration(
+                model="SIMPLE_PINHOLE",
+                width=calibration.width,
+                height=calibration.height,
+                params=[one_focal, *principal_point],
+                source=calibration.source,
+            )
+            logger.info(
+                "Video run: SIMPLE_PINHOLE f=%.1f px (focal refinement %s)",
+                one_focal,
+                "enabled" if cfg.sfm.refine_intrinsics else "disabled",
+            )
 
         # 4. Optional CLI overrides
         if getattr(args, "overlap", None) is not None:
@@ -545,6 +645,88 @@ def _handle_validate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_dense_command(args: argparse.Namespace) -> int:
+    """Execute CPU multi-view-stereo dense reconstruction on a completed run."""
+    from uav3d.dense import run_dense
+
+    logger = setup_logging()
+    cfg = load_config(args.config if os.path.exists(args.config) else None)
+    data_dir = args.data_dir or os.environ.get("UAV3D_DATA_DIR") or cfg.data_dir
+
+    with timed_stage("dense", logger=logger):
+        if getattr(args, "run_dir", None):
+            run_dir = Path(args.run_dir).resolve()
+        else:
+            outputs_dir = Path(data_dir) / "outputs"
+            if not outputs_dir.exists():
+                raise Uav3dError(f"Outputs directory {outputs_dir} does not exist. Run 'uav3d sfm' first.")
+            run_dirs = sorted(
+                [d for d in outputs_dir.iterdir() if d.is_dir() and d.name.startswith("run_")],
+                key=lambda p: p.name,
+            )
+            if not run_dirs:
+                raise Uav3dError(f"No run directories found in {outputs_dir}. Run 'uav3d sfm' first.")
+            run_dir = run_dirs[-1]
+
+        dense_cfg: DenseConfig = cfg.dense.model_copy(deep=True)
+        if getattr(args, "quick", False):
+            dense_cfg.max_width = 960
+            dense_cfg.ref_stride = 2
+            dense_cfg.max_planes = 64
+            dense_cfg.mesh = True
+        if getattr(args, "max_width", None):
+            dense_cfg.max_width = int(args.max_width)
+        if getattr(args, "ref_stride", None):
+            dense_cfg.ref_stride = int(args.ref_stride)
+        if getattr(args, "num_sources", None):
+            dense_cfg.num_sources = int(args.num_sources)
+        if getattr(args, "depth_range", None):
+            dense_cfg.depth_range = args.depth_range
+        if getattr(args, "scale_source", None):
+            dense_cfg.scale_source = args.scale_source
+        if getattr(args, "scale_factor", None):
+            dense_cfg.scale_factor = float(args.scale_factor)
+        if getattr(args, "no_mesh", False):
+            dense_cfg.mesh = False
+
+        logger.info(f"Dense reconstruction for run: {run_dir}")
+        result = run_dense(
+            run_dir=run_dir,
+            config=dense_cfg,
+            output_dir=args.output_dir,
+            ground_truth_ply=args.gt_ply,
+        )
+
+        table = Table(title=f"CPU Dense Reconstruction: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
+        table.add_column("Metric / Property", style="bold white", width=30)
+        table.add_column("Value", style="green")
+
+        rep = result.report
+        table.add_row("Backend", f"{rep.backend} (multi-view stereo, CPU)")
+        table.add_row("Reference Views", str(rep.geometry.num_reference_views))
+        table.add_row("Working Resolution", f"{rep.geometry.working_width}x{rep.geometry.working_height}")
+        table.add_row("Median Baseline / Depth", f"{rep.geometry.median_baseline_ratio:.3f}")
+        table.add_row("Valid Depth Pixels", f"{rep.depth.valid_fraction * 100:.1f}%")
+        table.add_row("Depth Sigma (units)", f"{rep.fusion.depth_sigma_units:.4f}")
+        table.add_row("Fusion Voxel", f"{rep.fusion.voxel_units:.4f} units"
+                      + (f" ({rep.fusion.voxel_meters:.3f} m)" if rep.fusion.voxel_meters else ""))
+        table.add_row("Fused Points", f"[bold]{rep.fusion.num_points}[/bold]")
+        if rep.mesh is not None:
+            table.add_row("Mesh", f"{rep.mesh.num_vertices} vertices, {rep.mesh.num_faces} triangles")
+        table.add_row("Metric Scale", f"{rep.scale.value:.4f} m/unit ({rep.scale.status})")
+        if rep.evaluation:
+            for key in ("accuracy_median", "precision_at_0.5m", "completeness_at_0.5m", "fscore_at_0.5m"):
+                if key in rep.evaluation:
+                    table.add_row(f"Eval {key}", f"{rep.evaluation[key]:.4f}")
+        table.add_row("Point Cloud", str(result.point_cloud_path))
+        if result.mesh_path is not None:
+            table.add_row("Mesh File", str(result.mesh_path))
+        table.add_row("Report", str(result.report_path))
+        table.add_row("Total Runtime", f"{result.total_seconds:.1f} s")
+        console.print(table)
+    return 0
+
+
 def _handle_stub_command(command_name: str, args: argparse.Namespace) -> int:
     """Execute stub for unimplemented pipeline stage."""
     logger = setup_logging()
@@ -651,6 +833,78 @@ def create_parser() -> argparse.ArgumentParser:
         help="Path to GroundTruthAGL.csv (defaults to dataset location)",
     )
 
+    # 6. dense
+    dense_parser = subparsers.add_parser(
+        "dense",
+        help="CPU multi-view-stereo dense reconstruction (depth, point cloud, mesh)",
+    )
+    _add_common_arguments(dense_parser)
+    dense_parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Run directory containing poses.json and keyframes.json (defaults to latest)",
+    )
+    dense_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Destination directory (defaults to <run-dir>/dense)",
+    )
+    dense_parser.add_argument(
+        "--max-width",
+        type=int,
+        default=None,
+        help="Working image width (default from config)",
+    )
+    dense_parser.add_argument(
+        "--ref-stride",
+        type=int,
+        default=None,
+        help="Use every Nth frame as a depth reference (2 halves runtime)",
+    )
+    dense_parser.add_argument(
+        "--num-sources",
+        type=int,
+        default=None,
+        help="Source views fused per reference view",
+    )
+    dense_parser.add_argument(
+        "--depth-range",
+        type=str,
+        default=None,
+        help="Manual depth range 'MIN:MAX' in SfM units (overrides sparse-point derivation)",
+    )
+    dense_parser.add_argument(
+        "--scale-source",
+        type=str,
+        choices=["none", "fixed", "gnss"],
+        default=None,
+        help="Metric scale source: none (SfM units), fixed (--scale-factor), or gnss (telemetry)",
+    )
+    dense_parser.add_argument(
+        "--scale-factor",
+        type=float,
+        default=None,
+        help="Metres per SfM unit when --scale-source fixed",
+    )
+    dense_parser.add_argument(
+        "--gt-ply",
+        type=str,
+        default=None,
+        help="Optional ground-truth point cloud (metres) for accuracy/completeness evaluation",
+    )
+    dense_parser.add_argument(
+        "--no-mesh",
+        action="store_true",
+        help="Skip mesh reconstruction (point cloud only)",
+    )
+    dense_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Fast preset: 960 px width, every 2nd reference view, 64 planes",
+    )
+
     return parser
 
 
@@ -673,6 +927,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_sync_command(args)
         if args.command == "validate":
             return _handle_validate_command(args)
+        if args.command == "dense":
+            return _handle_dense_command(args)
         if args.command in SUBCOMMANDS:
             return _handle_stub_command(args.command, args)
         parser.print_help()
