@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "pycolmap==3.12.*",
-    "opencv-python==4.10.*",
+    # Headless build: the pipeline only reads and writes image files, never opens
+    # a window. opencv-python links libGL.so.1 and fails to import on a slim CPU
+    # image, which breaks every stage at import time.
+    "opencv-python-headless==4.10.*",
     "numpy",
     "scipy",
     "pydantic>=2",
