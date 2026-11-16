@@ -34,6 +34,7 @@ from uav3d.dense.cameras import (
 )
 from uav3d.dense.config import DenseConfig
 from uav3d.dense.consistency import filter_estimate
+from uav3d.dense.coverage import compute_coverage, write_coverage_report
 from uav3d.dense.evaluate import cloud_metrics, estimate_point_spacing, load_ply_points
 from uav3d.dense.fusion import (
     VoxelAccumulator,
@@ -678,6 +679,7 @@ def run_dense(
     # cross_view_agreement would reject them against neighbour maps that have
     # the same holes. fill_from_prior never touches measured (valid) pixels.
     prior_filled = 0
+    prior_filled_by_view: dict[int, int] = {}
     if prior_maps:
         t0 = time.time()
         views_filled = 0
@@ -724,6 +726,7 @@ def run_dense(
                 filtered_in_memory[index] = filled_estimate.depth
                 _save_depth(_depth_path(filtered_dir, index), filled_estimate.depth)
                 prior_filled += filled
+                prior_filled_by_view[index] = filled
                 views_filled += 1
         stage_seconds["prior_fill"] = time.time() - t0
         logger.info(
@@ -861,8 +864,45 @@ def run_dense(
         evaluation.update(scale_extra)
         stage_seconds["evaluation"] = time.time() - t0
 
+    # --- 8b. coverage ------------------------------------------------------
+    # Reporting only: a failure here must never discard a finished dense
+    # run, so it degrades to "no coverage report" with a warning.
+    coverage: dict | None = None
+    coverage_path: Path | None = None
+    t0 = time.time()
+    try:
+        coverage = compute_coverage(
+            out_dir,
+            scale=scale,
+            scale_source=scale_source,
+            scale_verified=scale_source != "none",
+            cell_size_m=config.coverage_cell_size_m,
+            thin_fraction=config.coverage_thin_fraction,
+            hole_fraction_warn=config.coverage_hole_fraction_warn,
+            hole_fraction_bad=config.coverage_hole_fraction_bad,
+            thin_fraction_bad=config.coverage_thin_fraction_bad,
+            prior_enabled=bool(prior_summary is not None and prior_summary.enabled),
+            prior_pixels_filled=prior_summary.pixels_filled if prior_summary else None,
+            prior_pixels_measured=prior_summary.pixels_measured if prior_summary else None,
+            per_view_filled_pixels=prior_filled_by_view or None,
+            voxel_units=voxel_units,
+        )
+        coverage_path = write_coverage_report(out_dir, coverage)
+        logger.info(
+            "Coverage verdict %s: %.1f%% of %d footprint cells empty, %.1f%% thin",
+            coverage["verdict"],
+            100.0 * coverage["grid"]["empty_fraction"],
+            coverage["grid"]["num_cells"],
+            100.0 * coverage["grid"]["thin_fraction"],
+        )
+    except Exception as exc:  # noqa: BLE001 - coverage is reporting, not reconstruction
+        logger.warning("Coverage reporting failed (%s); continuing without it", exc)
+    stage_seconds["coverage"] = time.time() - t0
+
     # --- 9. report ---------------------------------------------------------
     artifacts = {"cloud": str(cloud_path)}
+    if coverage_path is not None:
+        artifacts["coverage_report"] = str(coverage_path)
     if mesh_path is not None:
         artifacts["mesh"] = str(mesh_path)
     if glb_path is not None:
@@ -907,6 +947,7 @@ def run_dense(
         prior=prior_summary,
         scale=DenseScaleSummary(value=scale, source=scale_source, status=scale_status),
         evaluation=evaluation,
+        coverage=coverage,
         stage_seconds={k: round(v, 3) for k, v in stage_seconds.items()},
         total_seconds=round(time.time() - started, 3),
         artifacts=artifacts,
@@ -988,6 +1029,36 @@ def _write_markdown(path: Path, report: DenseReport) -> None:
             f"(inferred, not measured; measured in final maps: {report.prior.pixels_measured:,}); "
             f"final coverage {report.prior.final_valid_fraction * 100:.1f}%; see prior_report.json"
         )
+    if report.coverage:
+        cov = report.coverage
+        summary = cov.get("per_view_summary") or {}
+        fused = cov.get("fused") or {}
+        grid = cov.get("grid") or {}
+        unit = cov.get("unit") or "SfM units"
+        area_unit = "m^2" if unit == "m" else "SfM unit^2"
+        lines += [
+            "",
+            "## Coverage",
+            "",
+            f"- Verdict: **{cov.get('verdict')}**"
+            + (f" — {'; '.join(cov.get('verdict_reasons') or [])}" if cov.get("verdict_reasons") else ""),
+            f"- Per-view valid depth (final maps): "
+            f"{100.0 * (summary.get('min_valid_fraction') or 0):.1f}%–"
+            f"{100.0 * (summary.get('max_valid_fraction') or 0):.1f}% "
+            f"(median {100.0 * (summary.get('median_valid_fraction') or 0):.1f}% over "
+            f"{summary.get('num_views')} views)"
+            + ("; final maps include prior-filled (inferred) pixels" if (cov.get("prior") or {}).get("enabled") else "; all valid pixels are measured"),
+            f"- Fused density: {fused.get('points_per_unit_area', 0):,.0f} points/{area_unit} "
+            f"over {fused.get('footprint_area', 0):,.1f} {area_unit} "
+            f"({fused.get('num_points', 0):,} points; footprint on the PCA PC1–PC2 plane, "
+            f"units: {unit})",
+            f"- Grid ({grid.get('cell_size')} {unit} cells): "
+            f"{grid.get('empty_cells')} of {grid.get('num_cells')} footprint cells empty "
+            f"({100.0 * (grid.get('empty_fraction') or 0):.1f}%), "
+            f"{grid.get('thin_cells')} thin ({100.0 * (grid.get('thin_fraction') or 0):.1f}%, "
+            f"below {grid.get('thin_threshold_points_per_cell', 0):,.0f} points/cell)",
+            "- Full per-view fractions, emptiest cells and thresholds: see coverage_report.json",
+        ]
     if report.evaluation:
         lines += ["", "## Ground-truth evaluation", ""]
         for key, value in sorted(report.evaluation.items()):

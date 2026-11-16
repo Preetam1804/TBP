@@ -263,6 +263,43 @@ class DenseConfig(BaseModel):
         description="Metric scale (metres per SfM unit) when scale_source is 'fixed'",
     )
 
+    # --- coverage reporting (Phase 4) --------------------------------------
+    # Thresholds are documented in uav3d/dense/coverage.py; changing them
+    # changes the verdict gate in scripts/run_video_pipeline.py, so a run's
+    # coverage_report.json always records the thresholds it was judged by.
+    coverage_cell_size_m: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Grid cell size for hole/thin analysis, in metres when the scale "
+            "is verified, otherwise in SfM units (scale unverified)"
+        ),
+    )
+    coverage_thin_fraction: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        description="A grid cell holding less than this fraction of the mean per-cell point count is thin",
+    )
+    coverage_hole_fraction_warn: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Empty-cell fraction above this makes the coverage verdict 'thin'",
+    )
+    coverage_hole_fraction_bad: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        description="Empty-cell fraction above this makes the coverage verdict 'holes'",
+    )
+    coverage_thin_fraction_bad: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Thin-cell fraction above this makes the coverage verdict 'thin'",
+    )
+
     # --- runtime ------------------------------------------------------------
     keep_depth_in_memory: bool = Field(
         default=True,

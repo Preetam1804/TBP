@@ -34,9 +34,14 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import cv2  # noqa: E402
 
 from uav3d.cli import main  # noqa: E402
+from uav3d.dense.coverage import coverage_gate_ok  # noqa: E402
 from uav3d.dense.evaluate import load_ply_points  # noqa: E402
 from uav3d.models.calibration_io import read_calibration  # noqa: E402
-from uav3d.sfm.focal_gate import check_focal_drift, solved_focal_px  # noqa: E402
+from uav3d.sfm.focal_gate import (  # noqa: E402
+    check_focal_drift,
+    describe_focal_source,
+    solved_focal_px,
+)
 
 
 def _host_fs_path(path: Path) -> Path:
@@ -65,12 +70,15 @@ def newest_run_dir() -> Path | None:
     return runs[-1] if runs else None
 
 
-def stage_keyframes(video: Path, config: Path, start_frame: int = 0, end_frame: int | None = None) -> Path:
+def stage_keyframes(video: Path, config: Path, start_frame: int = 0, end_frame: int | None = None,
+                    focal_px: float | None = None) -> Path:
     argv = ["keyframes", "--video", str(video), "--config", str(config)]
     if start_frame:
         argv += ["--start-frame", str(start_frame)]
     if end_frame is not None:
         argv += ["--end-frame", str(end_frame)]
+    if focal_px is not None:
+        argv += ["--focal-px", str(focal_px)]
     code = main(argv)
     if code != 0:
         raise SystemExit(f"keyframes stage failed with exit code {code}")
@@ -80,8 +88,11 @@ def stage_keyframes(video: Path, config: Path, start_frame: int = 0, end_frame: 
     return run_dir
 
 
-def stage_sfm(run_dir: Path, config: Path) -> dict:
-    code = main(["sfm", "--config", str(config), "--run-dir", str(run_dir)])
+def stage_sfm(run_dir: Path, config: Path, focal_px: float | None = None) -> dict:
+    argv = ["sfm", "--config", str(config), "--run-dir", str(run_dir)]
+    if focal_px is not None:
+        argv += ["--focal-px", str(focal_px)]
+    code = main(argv)
     if code != 0:
         raise SystemExit(f"sfm stage failed with exit code {code}")
     poses = json.loads((run_dir / "poses.json").read_text())
@@ -141,6 +152,8 @@ def summarise(video: Path, info: dict, run_dir: Path, poses: dict | None, dense:
         # usually means a depth stretch was absorbed into the camera. The
         # gate flags it; it never clamps the focal.
         if stored is not None:
+            print(f"          prior focal from {describe_focal_source(stored.source)} "
+                  f"({stored.source})")
             try:
                 gate = check_focal_drift(
                     solved_focal_px(stored.model, list(stored.params)),
@@ -163,6 +176,8 @@ def summarise(video: Path, info: dict, run_dir: Path, poses: dict | None, dense:
             else f"{stored.params[0] / stored.params[1]:.3f}"
         )
         print(f"CAMERA    {stored.model} [{params}]  aspect {aspect}")
+        print(f"          prior focal from {describe_focal_source(stored.source)} "
+              f"({stored.source})")
         if not stored.model.upper().endswith("SIMPLE_PINHOLE"):
             ratio = stored.params[0] / stored.params[1]
             if abs(ratio - 1.0) > 0.05:
@@ -215,6 +230,37 @@ def summarise(video: Path, info: dict, run_dir: Path, poses: dict | None, dense:
                   "the scene may be too textureless or the baseline too small")
             ok = False
 
+        coverage = dense.get("coverage") or {}
+        if coverage:
+            summary = coverage.get("per_view_summary") or {}
+            fused = coverage.get("fused") or {}
+            grid = coverage.get("grid") or {}
+            unit = coverage.get("unit") or "SfM units"
+            area_unit = "m^2" if unit == "m" else "SfM unit^2"
+            lo = 100.0 * (summary.get("min_valid_fraction") or 0.0)
+            hi = 100.0 * (summary.get("max_valid_fraction") or 0.0)
+            med = 100.0 * (summary.get("median_valid_fraction") or 0.0)
+            provenance = (
+                "final maps include prior-filled (inferred) pixels"
+                if (coverage.get("prior") or {}).get("enabled")
+                else "all valid pixels are measured"
+            )
+            print(f"COVERAGE  per-view valid {lo:.1f}%-{hi:.1f}% "
+                  f"(median {med:.1f}% over {summary.get('num_views')} views); {provenance}")
+            print(f"          fused density {fused.get('points_per_unit_area', 0):,.0f} "
+                  f"points/{area_unit} over {fused.get('footprint_area', 0):,.1f} {area_unit}")
+            print(f"          grid {grid.get('empty_cells')} of {grid.get('num_cells')} "
+                  f"footprint cells empty ({100.0 * (grid.get('empty_fraction') or 0):.1f}%), "
+                  f"{grid.get('thin_cells')} thin ({100.0 * (grid.get('thin_fraction') or 0):.1f}%)")
+            print(f"          verdict {coverage.get('verdict')}")
+            if not coverage_gate_ok(coverage):
+                print(f"  WARNING  coverage verdict is {coverage.get('verdict')!r}: "
+                      + "; ".join(coverage.get("verdict_reasons") or [])
+                      + " — the model has thin or missing regions; see coverage_report.json")
+                ok = False
+        else:
+            print("COVERAGE  no coverage report (run predates Phase 4 coverage reporting)")
+
     cloud = run_dir / "dense" / "cloud.ply"
     if cloud.exists():
         try:
@@ -248,6 +294,17 @@ def main_cli() -> int:
         help="Last video frame to ingest (0-based, exclusive)",
     )
     parser.add_argument("--mesh", action="store_true", help="Also build the visualisation mesh")
+    parser.add_argument(
+        "--focal-px",
+        type=float,
+        default=None,
+        help=(
+            "Known focal length in pixels (fx = fy). Overrides config "
+            "source.focal_px and any <video-stem>.meta.json sidecar; without "
+            "it the sidecar wins over the 0.8*width guess. Must be within "
+            "0.2*width..5*width."
+        ),
+    )
     parser.add_argument("--prior", action="store_true",
                         help="Fill MVS-invalid pixels with a monocular depth prior (default off)")
     parser.add_argument("--preview", action="store_true",
@@ -290,7 +347,8 @@ def main_cli() -> int:
 
     if args.stage in ("keyframes", "all") and run_dir is None:
         print("\n--- keyframes ---")
-        run_dir = stage_keyframes(video, config, args.start_frame, args.end_frame)
+        run_dir = stage_keyframes(video, config, args.start_frame, args.end_frame,
+                                  focal_px=args.focal_px)
     elif run_dir is None:
         run_dir = newest_run_dir()
         if run_dir is None:
@@ -298,7 +356,7 @@ def main_cli() -> int:
 
     if args.stage in ("sfm", "all"):
         print("\n--- sfm ---")
-        poses = stage_sfm(run_dir, config)
+        poses = stage_sfm(run_dir, config, focal_px=args.focal_px)
 
     if args.stage in ("dense", "all"):
         print("\n--- dense ---")

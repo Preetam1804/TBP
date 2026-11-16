@@ -22,6 +22,7 @@ from uav3d.models.frames import CameraCalibration
 from uav3d.models.keyframes import KeyframesFile
 from uav3d.models.poses import PosesFile
 from uav3d.sfm import SfmRunner, export_poses
+from uav3d.sfm.focal_gate import describe_focal_source
 from uav3d.sources.base import ImageSource
 from uav3d.sources.video import VideoFileSource
 from uav3d.sources.zurich import ZurichSequenceSource
@@ -60,11 +61,32 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_focal_px_argument(parser: argparse.ArgumentParser) -> None:
+    """Attach the --focal-px override flag to a video subcommand parser."""
+    parser.add_argument(
+        "--focal-px",
+        type=float,
+        default=None,
+        help=(
+            "Known focal length in pixels (fx = fy) for a video source. "
+            "Overrides config source.focal_px and any <video-stem>.meta.json "
+            "sidecar; without it the sidecar wins over the 0.8*width guess. "
+            "Must be within 0.2*width..5*width."
+        ),
+    )
+
+
 def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) -> ImageSource:
     """Build and initialize ImageSource adapter from configuration or CLI arguments."""
     video_cli = getattr(args, "video", None)
     start_frame = int(getattr(args, "start_frame", 0) or 0)
     end_frame = getattr(args, "end_frame", None)
+    # Known-focal precedence: CLI --focal-px > config source.focal_px > sidecar
+    # (read by VideoFileSource) > 0.8*width guess. A None here means "no
+    # explicit override"; the config value is passed through the same way.
+    focal_px = getattr(args, "focal_px", None)
+    if focal_px is None:
+        focal_px = cfg.source.focal_px
     if video_cli:
         video_path = Path(video_cli).resolve()
         if not video_path.exists():
@@ -73,6 +95,7 @@ def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) 
             video_path=video_path,
             start_frame=start_frame,
             end_frame=end_frame,
+            focal_px=focal_px,
         )
 
     source_type = cfg.source.type.lower()
@@ -95,6 +118,7 @@ def _build_source(cfg: PipelineConfig, data_dir: str, args: argparse.Namespace) 
             video_path=video_path,
             start_frame=start_frame,
             end_frame=end_frame,
+            focal_px=focal_px,
         )
 
     raise Uav3dError(f"Unsupported source type '{source_type}'. Must be 'zurich' or 'video'.")
@@ -196,7 +220,8 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
 
         # Persist the source intrinsics so later stages never need the video file.
         # Written only after the run is known to be usable.
-        write_calibration(source.calibration(), run_dir)
+        calibration = source.calibration()
+        write_calibration(calibration, run_dir)
 
         table = Table(title=f"Keyframe Extraction Summary: [bold cyan]{run_dir.name}[/bold cyan]", show_header=True)
         table.add_column("Metric / Property", style="bold white", width=28)
@@ -222,6 +247,11 @@ def _handle_keyframes_command(args: argparse.Namespace) -> int:
         table.add_row("Keyframes JSON", str(summary.keyframes_json_path))
         table.add_row("SfM Images Directory", str(summary.sfm_images_dir))
         table.add_row("Contact Sheet", str(summary.contact_sheet_path))
+        table.add_row(
+            "Prior Focal",
+            f"{calibration.params[0]:.1f} px "
+            f"({describe_focal_source(calibration.source)}; {calibration.source})",
+        )
 
         console.print(table)
     return 0
@@ -262,6 +292,32 @@ def _scale_calibration_params(model: str, params: list[float], sx: float, sy: fl
     scaled[cx_index] *= sx
     scaled[cy_index] *= sy
     return scaled
+
+
+def sfm_gate_failures(
+    registration_rate: float,
+    mean_reprojection_error_px: float,
+    focal_drift_exceeded: bool,
+    focal_drift_rel: float | None,
+) -> list[str]:
+    """List the SfM quality gates a run failed (empty means all passed).
+
+    Pure function so the "Passed" verdict in the SfM summary can be tested
+    without running COLMAP. Thresholds: registration >= 85%, reprojection
+    <= 1.5 px, focal drift within its gate.
+    """
+    failures: list[str] = []
+    if registration_rate < 0.85:
+        failures.append(f"registration {registration_rate * 100:.1f}% < 85%")
+    if mean_reprojection_error_px > 1.5:
+        failures.append(
+            f"reprojection {mean_reprojection_error_px:.3f} px > 1.5 px"
+        )
+    if focal_drift_exceeded:
+        failures.append(
+            f"focal drift {100.0 * (focal_drift_rel or 0.0):+.1f}% exceeds the gate"
+        )
+    return failures
 
 
 def _handle_sfm_command(args: argparse.Namespace) -> int:
@@ -338,6 +394,38 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
             # config resolution would silently rescale every principal point.
             source = _build_source(cfg, data_dir, args)
             calibration = source.calibration()
+        # An explicit --focal-px on the SfM command overrides the stored prior
+        # focal (the stored calibration is otherwise authoritative). It is
+        # applied here, in video pixels, so the rescale block below scales it
+        # exactly like a config/sidecar focal. The config value alone does not
+        # rewrite a stored calibration: it already took effect at keyframes
+        # time, when calibration.json was written.
+        if getattr(args, "focal_px", None) is not None:
+            focal_override = float(args.focal_px)
+            if focal_override <= 0:
+                raise Uav3dError(f"--focal-px must be positive, got {focal_override}")
+            lo, hi = 0.2 * calibration.width, 5.0 * calibration.width
+            if not lo <= focal_override <= hi:
+                raise Uav3dError(
+                    f"--focal-px {focal_override} px is outside the sane range "
+                    f"{lo:.1f}..{hi:.1f} px (0.2*width..5*width for "
+                    f"{calibration.width} px wide frames)"
+                )
+            focal_terms, _ = _CAMERA_LAYOUT.get(calibration.model.upper(), (1, 2))
+            params = [float(v) for v in calibration.params]
+            params[0] = focal_override
+            if focal_terms == 2:
+                params[1] = focal_override
+            calibration = CameraCalibration(
+                model=calibration.model,
+                width=calibration.width,
+                height=calibration.height,
+                params=params,
+                source="video_config_override",
+            )
+            logger.info(
+                "CLI --focal-px override: prior focal set to %.1f px", focal_override
+            )
         if actual_width and actual_height and (
             int(calibration.width), int(calibration.height)
         ) != (actual_width, actual_height):
@@ -442,6 +530,10 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
             "Intrinsics Locked",
             f"{poses_file.camera.params if poses_file.camera else calibration.params}",
         )
+        table.add_row(
+            "Prior Focal Source",
+            f"{describe_focal_source(calibration.source)} ({calibration.source})",
+        )
         table.add_row("Matcher", f"{result.matcher_type}")
         if result.prior_focal_px is not None and result.solved_focal_px is not None:
             drift_pct = 100.0 * (result.focal_drift_rel or 0.0)
@@ -465,6 +557,22 @@ def _handle_sfm_command(args: argparse.Namespace) -> int:
                 "Forward flight trades focal length against depth, so the model may "
                 "be stretched along the flight axis. Consider re-running with "
                 "refine_intrinsics=false.[/yellow]"
+            )
+        # The "Passed" verdict must reflect every gate, not just the focal
+        # gate: previously the else-branch here printed "SfM Quality Gate
+        # Passed: Registration 46.7% >= 85%" on a run that had failed the
+        # registration gate, because the else only meant "drift not exceeded".
+        gate_failures = sfm_gate_failures(
+            result.registration_rate,
+            result.mean_reprojection_error_px,
+            result.focal_drift_exceeded,
+            result.focal_drift_rel,
+        )
+        if gate_failures:
+            console.print(
+                "[bold red]SfM Quality Gate NOT passed:[/bold red] "
+                + "; ".join(gate_failures)
+                + "."
             )
         else:
             console.print(
@@ -798,6 +906,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Inspect raw video/sequence metadata, calibration, and timestamps",
     )
     _add_common_arguments(inspect_parser)
+    _add_focal_px_argument(inspect_parser)
 
     # 2. keyframes
     keyframes_parser = subparsers.add_parser(
@@ -817,6 +926,7 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Last video frame to ingest (0-based, exclusive; video input only)",
     )
+    _add_focal_px_argument(keyframes_parser)
 
     # 3. sfm
     sfm_parser = subparsers.add_parser(
@@ -843,6 +953,7 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override matcher: sequential (default) or exhaustive (closes loops on revisits, O(n^2))",
     )
+    _add_focal_px_argument(sfm_parser)
 
     # 4. sync
     sync_parser = subparsers.add_parser(

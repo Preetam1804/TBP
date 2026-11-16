@@ -1,5 +1,7 @@
 """Tests for uav3d schemas, config loading, and CLI commands."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -175,7 +177,28 @@ class TestCliSmoke:
 
     @pytest.mark.parametrize("subcommand", ["inspect", "keyframes", "sfm", "sync", "validate"])
     def test_subcommand_stub_execution(self, subcommand: str) -> None:
+        # Smoke test over the historical Zurich run. The Zurich dataset and
+        # that run directory are untracked and absent from a fresh clone, so
+        # skip (do not fail) when the required data is not present.
+        if subcommand in {"inspect", "keyframes"} and not Path(
+            "data/raw/zurich_mav"
+        ).exists():
+            pytest.skip("Zurich dataset (data/raw/zurich_mav) not present in this checkout")
+        run_dir = Path("data/outputs/run_20260914_112220")
+        if subcommand == "sfm" and not (run_dir / "keyframes.json").exists():
+            pytest.skip(
+                "SfM smoke run dir data/outputs/run_20260914_112220 "
+                "(keyframes.json) not present in this checkout"
+            )
+        if subcommand in {"sync", "validate"} and not (run_dir / "poses.json").exists():
+            pytest.skip(
+                "Validation run dir data/outputs/run_20260914_112220 "
+                "(poses.json) not present in this checkout"
+            )
         cmd = [subcommand, "--config", "configs/zurich_baseline.yaml"]
-        if subcommand in {"sync", "validate"}:
-            cmd.extend(["--run-dir", "data/outputs/run_20260914_112220"])
+        if subcommand in {"sfm", "sync", "validate"}:
+            # Pin to the historical run dir: the default (newest run dir) is
+            # order-dependent — other tests create run dirs — and made this
+            # smoke test fail spuriously in the full suite.
+            cmd.extend(["--run-dir", str(run_dir)])
         assert main(cmd) == 0
