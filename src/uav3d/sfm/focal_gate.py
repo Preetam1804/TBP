@@ -25,6 +25,29 @@ _SINGLE_FOCAL_MODELS = {"SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"}
 _FX_FY_MODELS = {"PINHOLE", "OPENCV", "FULL_OPENCV"}
 
 
+def describe_focal_source(source: str) -> str:
+    """Human-readable origin of a prior focal, for auditability in reports.
+
+    The ``CameraCalibration.source`` string records the origin; this turns it
+    into the short label the SfM summary and the pipeline report print next
+    to the focal-drift gate verdict, so a locked-focal run is auditable:
+
+    - ``"video_config_override"`` -> config/CLI override (highest precedence)
+    - ``"video_meta_sidecar:<file>"`` -> sidecar ``<video-stem>.meta.json``
+    - ``"video_estimate_<file>"`` -> the 0.8*width guess (lowest precedence)
+
+    Any other source string (e.g. a Zurich calibration file) is returned
+    unchanged.
+    """
+    if source == "video_config_override":
+        return "config/CLI override"
+    if source.startswith("video_meta_sidecar:"):
+        return f"sidecar meta.json ({source.split(':', 1)[1]})"
+    if source.startswith("video_estimate"):
+        return "0.8*width guess"
+    return source
+
+
 def solved_focal_px(model: str, params: list[float]) -> float:
     """Extract the (mean) focal length in pixels from a COLMAP parameter vector.
 

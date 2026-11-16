@@ -199,3 +199,33 @@ class TestSfmRunnerLogic:
         rss = get_peak_rss_mb()
         assert isinstance(rss, float)
         assert rss >= 0.0
+
+
+class TestSfmGateFailures:
+    """The SfM summary's "Passed" verdict must reflect every gate."""
+
+    def test_all_gates_pass(self) -> None:
+        from uav3d.cli import sfm_gate_failures
+
+        assert sfm_gate_failures(1.0, 0.28, False, 0.04) == []
+
+    def test_low_registration_fails_even_without_drift(self) -> None:
+        # Regression: the old else-branch printed "Quality Gate Passed:
+        # Registration 46.7% >= 85%" on a collapsed run, because the else
+        # only meant "focal drift not exceeded".
+        from uav3d.cli import sfm_gate_failures
+
+        failures = sfm_gate_failures(0.467, 0.273, False, -0.044)
+        assert len(failures) == 1
+        assert "registration 46.7% < 85%" in failures[0]
+
+    def test_reprojection_and_drift_each_fail(self) -> None:
+        from uav3d.cli import sfm_gate_failures
+
+        assert any("reprojection" in f for f in sfm_gate_failures(1.0, 2.1, False, 0.0))
+        assert any("focal drift" in f for f in sfm_gate_failures(1.0, 0.3, True, 0.31))
+
+    def test_boundary_values_pass(self) -> None:
+        from uav3d.cli import sfm_gate_failures
+
+        assert sfm_gate_failures(0.85, 1.5, False, 0.10) == []

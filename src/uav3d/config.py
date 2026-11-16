@@ -110,6 +110,18 @@ class SourceConfig(BaseModel):
     type: str = Field(default="zurich", description="Source type: 'zurich' or 'video'")
     dataset_dir: str = Field(default="data/raw/zurich_mav", description="Path to Zurich dataset root")
     video_path: str | None = Field(default=None, description="Path to video file if type is 'video'")
+    focal_px: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Known focal length in pixels for a video source (fx = fy = focal_px). "
+            "Takes precedence over a <video-stem>.meta.json sidecar, which in turn "
+            "takes precedence over the 0.8*width guess. Must be positive here; the "
+            "width-relative range check (0.2*width .. 5*width) is applied by "
+            "VideoFileSource, which is the only place the frame width is known, "
+            "and an out-of-range value fails the run rather than silently guessing."
+        ),
+    )
     start_id: int = Field(default=0, ge=0, description="Starting numeric image/frame identifier")
     count: int = Field(default=250, gt=0, le=300, description="Contiguous frame count (<= 300)")
     stride: int = Field(default=1, ge=1, description="Frame sampling stride")

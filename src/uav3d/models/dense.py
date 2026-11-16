@@ -116,6 +116,10 @@ class DenseReport(BaseModel):
     )
     scale: DenseScaleSummary
     evaluation: dict[str, Any] | None = Field(default=None, description="Ground-truth metrics when supplied")
+    coverage: dict[str, Any] | None = Field(
+        default=None,
+        description="Phase 4 coverage report (per-view depth yield, fused density, grid holes); see coverage_report.json",
+    )
     stage_seconds: dict[str, float] = Field(default_factory=dict)
     total_seconds: float = Field(..., ge=0.0)
     artifacts: dict[str, str] = Field(default_factory=dict)

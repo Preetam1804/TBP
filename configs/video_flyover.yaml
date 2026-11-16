@@ -27,6 +27,14 @@ source:
   type: "video"
   # Overridden by --video on the command line.
   video_path: "data/city_flyover.mp4"
+  # Known focal length in pixels (fx = fy), if you have one — from the camera
+  # spec, a calibration capture, or EXIF. Precedence: --focal-px on the command
+  # line > this source.focal_px > a <video-stem>.meta.json sidecar next to the
+  # video ({"focal_px": <pixels>}) > the 0.8*width guess. Must be positive and
+  # within 0.2*width..5*width; an invalid value fails the run, while an
+  # invalid sidecar value is only warned about and ignored. Leave unset to
+  # keep the guess. See README "Supplying a known focal length for a video".
+  # focal_px: null
   count: 300
   stride: 1
 

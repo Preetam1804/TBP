@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import cv2
+import pytest
 import numpy as np
 import yaml
 
